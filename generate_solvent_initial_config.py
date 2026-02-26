@@ -277,6 +277,8 @@ def compute_forces_and_potential(
             dy = yi - sj.position_angstrom[1]
             dz = zi - sj.position_angstrom[2]
             r2 = dx * dx + dy * dy + dz * dz
+            if r2 < 1e-24:
+                raise ValueError("Encountered overlapping sites; cannot evaluate pairwise interactions at zero distance.")
             r = math.sqrt(r2)
             inv_r = 1.0 / r
 
