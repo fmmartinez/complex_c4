@@ -589,19 +589,34 @@ def write_initial_xyz(path: Path, sites: List[Site], comment: str) -> None:
 
 
 
-def propagate_fbts_mapping_half_step(mapping_vars: FBTSMappingVariables, h_eff: np.ndarray, dt_fs: float) -> None:
-    half_scale = 0.5 * dt_fs / HBAR_KCAL_MOL_FS
+def propagate_fbts_mapping_half_step(
+    mapping_vars: FBTSMappingVariables,
+    h_eff: np.ndarray,
+    dt_fs: float,
+    mapping_substeps: int = 1,
+) -> None:
+    if mapping_substeps < 1:
+        raise ValueError("mapping_substeps must be >= 1")
 
-    p_fwd_old = mapping_vars.p_fwd.copy()
-    q_fwd_old = mapping_vars.q_fwd.copy()
-    p_bwd_old = mapping_vars.p_bwd.copy()
-    q_bwd_old = mapping_vars.q_bwd.copy()
+    dt_sub = 0.5 * dt_fs / mapping_substeps
 
-    mapping_vars.p_fwd = p_fwd_old - half_scale * (h_eff @ q_fwd_old)
-    mapping_vars.q_fwd = q_fwd_old + half_scale * (h_eff @ p_fwd_old)
+    evals, evecs = np.linalg.eigh(h_eff)
+    omega_dt = (evals / HBAR_KCAL_MOL_FS) * dt_sub
+    cos_term = np.cos(omega_dt)
+    sin_term = np.sin(omega_dt)
 
-    mapping_vars.p_bwd = p_bwd_old - half_scale * (h_eff @ q_bwd_old)
-    mapping_vars.q_bwd = q_bwd_old + half_scale * (h_eff @ p_bwd_old)
+    def rotate_branch(q: np.ndarray, p: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        q_e = evecs.T @ q
+        p_e = evecs.T @ p
+
+        q_rot = cos_term * q_e + sin_term * p_e
+        p_rot = cos_term * p_e - sin_term * q_e
+
+        return evecs @ q_rot, evecs @ p_rot
+
+    for _ in range(mapping_substeps):
+        mapping_vars.q_fwd, mapping_vars.p_fwd = rotate_branch(mapping_vars.q_fwd, mapping_vars.p_fwd)
+        mapping_vars.q_bwd, mapping_vars.p_bwd = rotate_branch(mapping_vars.q_bwd, mapping_vars.p_bwd)
 
 
 def compute_fbts_forces_selected(
@@ -671,6 +686,7 @@ def run_nve_md(
     fbts_force_fd_step: float = 1e-4,
     fbts_force_method: str = "analytic",
     fbts_force_compare_fd: bool = False,
+    fbts_mapping_substeps: int = 1,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K\n", encoding="utf-8")
@@ -707,18 +723,6 @@ def run_nve_md(
             raise ValueError(
                 f"Initial R_AB={r_ab_init:.6f} Å is outside diabatic interpolation bounds [{r_min:.6f}, {r_max:.6f}] Å."
             )
-        forces = compute_fbts_forces_selected(
-            sites=sites,
-            n_solvent_molecules=n_solvent_molecules,
-            quantum_model=quantum_model,
-            mapping_vars=mapping_vars,
-            force_method=fbts_force_method,
-            fd_step=fbts_force_fd_step,
-            compare_fd=False,
-        )
-
-    fbts_active = quantum_model is not None and mapping_vars is not None
-    if fbts_active:
         forces = compute_fbts_forces_selected(
             sites=sites,
             n_solvent_molecules=n_solvent_molecules,
@@ -801,7 +805,7 @@ def run_nve_md(
 
         if fbts_active:
             _, _, h_eff_old = compute_fbts_hamiltonian_terms(sites, quantum_model)
-            propagate_fbts_mapping_half_step(mapping_vars, h_eff_old, dt_fs)
+            propagate_fbts_mapping_half_step(mapping_vars, h_eff_old, dt_fs, mapping_substeps=fbts_mapping_substeps)
 
         for site in sites:
             site.position_angstrom[0] += dt_fs * site.velocity_ang_fs[0]
@@ -833,7 +837,7 @@ def run_nve_md(
                 compare_fd=False,
             )
             _, _, h_eff_new = compute_fbts_hamiltonian_terms(sites, quantum_model)
-            propagate_fbts_mapping_half_step(mapping_vars, h_eff_new, dt_fs)
+            propagate_fbts_mapping_half_step(mapping_vars, h_eff_new, dt_fs, mapping_substeps=fbts_mapping_substeps)
         else:
             new_forces, _, _, _, _, _, _ = compute_forces_and_potential(sites, n_solvent_molecules)
 
@@ -1494,6 +1498,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fbts-force-fd-step", type=float, default=1e-4, help="Finite-difference displacement in Angstrom for FBTS force debugging")
     parser.add_argument("--fbts-force-method", type=str, default="analytic", choices=["analytic", "fd"])
     parser.add_argument("--fbts-force-compare-fd", action="store_true", help="Also compute FD forces and report max deviation when using analytic forces")
+    parser.add_argument("--fbts-mapping-substeps", type=int, default=1, help="Number of exact mapping substeps per half-step (1 disables subcycling)")
     return parser.parse_args()
 
 
@@ -1551,6 +1556,7 @@ def main() -> None:
         fbts_force_fd_step=args.fbts_force_fd_step,
         fbts_force_method=args.fbts_force_method,
         fbts_force_compare_fd=args.fbts_force_compare_fd,
+        fbts_mapping_substeps=args.fbts_mapping_substeps,
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
@@ -1576,6 +1582,7 @@ def main() -> None:
     print(f"FBTS Hamiltonian log written to: {args.fbts_hamiltonian_log}")
     print(f"FBTS mapping log written to: {args.fbts_mapping_log}")
     print(f"FBTS force method: {args.fbts_force_method}")
+    print(f"FBTS mapping substeps: {args.fbts_mapping_substeps}")
     print(f"FBTS force log written to: {args.fbts_force_log}")
 
 
