@@ -171,6 +171,10 @@ def main() -> None:
 
     if args.n_ho_per_center < 1:
         raise ValueError("--n-ho-per-center must be >= 1")
+    if args.grid_points < 4:
+        raise ValueError("--grid-points must be >= 4 for finite-difference second derivatives.")
+    if args.grid_step <= 0.0:
+        raise ValueError("--grid-step must be positive.")
 
     r_grid = np.asarray([args.grid_min + i * args.grid_step for i in range(args.grid_points)], dtype=float)
     weights = np.full(args.grid_points, args.grid_step, dtype=float)
