@@ -717,6 +717,18 @@ def run_nve_md(
             compare_fd=False,
         )
 
+    fbts_active = quantum_model is not None and mapping_vars is not None
+    if fbts_active:
+        forces = compute_fbts_forces_selected(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            quantum_model=quantum_model,
+            mapping_vars=mapping_vars,
+            force_method=fbts_force_method,
+            fd_step=fbts_force_fd_step,
+            compare_fd=False,
+        )
+
     for step in range(steps + 1):
         kinetic = kinetic_energy_kcal_mol(sites)
         temperature = instantaneous_temperature(sites)
