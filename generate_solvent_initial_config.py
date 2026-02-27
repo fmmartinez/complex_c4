@@ -613,17 +613,28 @@ def run_nve_md(
     trajectory_path: Path,
     energy_log_path: Path,
     quantum_model: Optional[FBTSQuantumModel] = None,
+    mapping_vars: Optional[FBTSMappingVariables] = None,
     fbts_hamiltonian_log_path: Optional[Path] = None,
+    fbts_mapping_log_path: Optional[Path] = None,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K Q_A Q_H Q_B f_pol r_AH\n", encoding="utf-8")
 
     if quantum_model is not None and fbts_hamiltonian_log_path is not None:
         n_states = quantum_model.n_states
-        cols = ["step", "time_fs"]
+        cols = ["step", "time_fs", "R_AB"]
         cols.extend([f"h_dia_{i+1}_{j+1}" for i in range(n_states) for j in range(n_states)])
         cols.extend([f"h_eff_{i+1}_{j+1}" for i in range(n_states) for j in range(n_states)])
         fbts_hamiltonian_log_path.write_text(" ".join(cols) + "\n", encoding="utf-8")
+
+    if mapping_vars is not None and fbts_mapping_log_path is not None:
+        n_states = mapping_vars.p_fwd.shape[0]
+        cols = ["step", "time_fs"]
+        cols.extend([f"p_fwd_{i+1}" for i in range(n_states)])
+        cols.extend([f"q_fwd_{i+1}" for i in range(n_states)])
+        cols.extend([f"p_bwd_{i+1}" for i in range(n_states)])
+        cols.extend([f"q_bwd_{i+1}" for i in range(n_states)])
+        fbts_mapping_log_path.write_text(" ".join(cols) + "\n", encoding="utf-8")
 
     forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
 
@@ -632,21 +643,31 @@ def run_nve_md(
         temperature = instantaneous_temperature(sites)
         total = kinetic + potential
 
-        with energy_log_path.open("a", encoding="utf-8") as flog:
-            flog.write(
-                f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f} "
-                f"{q_a:.8f} {q_h:.8f} {q_b:.8f} {f_pol:.8f} {r_ah:.8f}\n"
-            )
-
-        if quantum_model is not None and fbts_hamiltonian_log_path is not None:
-            h_dia, _, h_eff = compute_fbts_hamiltonian_terms(sites, quantum_model)
-            vals = [f"{step}", f"{step * dt_fs:.6f}"]
-            vals.extend([f"{h_dia[i, j]:.10f}" for i in range(h_dia.shape[0]) for j in range(h_dia.shape[1])])
-            vals.extend([f"{h_eff[i, j]:.10f}" for i in range(h_eff.shape[0]) for j in range(h_eff.shape[1])])
-            with fbts_hamiltonian_log_path.open("a", encoding="utf-8") as fh:
-                fh.write(" ".join(vals) + "\n")
-
         if step % write_frequency == 0:
+            with energy_log_path.open("a", encoding="utf-8") as flog:
+                flog.write(
+                    f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f} "
+                    f"{q_a:.8f} {q_h:.8f} {q_b:.8f} {f_pol:.8f} {r_ah:.8f}\n"
+                )
+
+            if quantum_model is not None and fbts_hamiltonian_log_path is not None:
+                r_ab = _compute_r_ab_from_sites(sites)
+                h_dia, _, h_eff = compute_fbts_hamiltonian_terms(sites, quantum_model)
+                vals = [f"{step}", f"{step * dt_fs:.6f}", f"{r_ab:.10f}"]
+                vals.extend([f"{h_dia[i, j]:.10f}" for i in range(h_dia.shape[0]) for j in range(h_dia.shape[1])])
+                vals.extend([f"{h_eff[i, j]:.10f}" for i in range(h_eff.shape[0]) for j in range(h_eff.shape[1])])
+                with fbts_hamiltonian_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(" ".join(vals) + "\n")
+
+            if mapping_vars is not None and fbts_mapping_log_path is not None:
+                vals = [f"{step}", f"{step * dt_fs:.6f}"]
+                vals.extend([f"{v:.10f}" for v in mapping_vars.p_fwd])
+                vals.extend([f"{v:.10f}" for v in mapping_vars.q_fwd])
+                vals.extend([f"{v:.10f}" for v in mapping_vars.p_bwd])
+                vals.extend([f"{v:.10f}" for v in mapping_vars.q_bwd])
+                with fbts_mapping_log_path.open("a", encoding="utf-8") as fm:
+                    fm.write(" ".join(vals) + "\n")
+
             append_xyz_frame(
                 trajectory_path,
                 sites,
@@ -1024,12 +1045,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--initial-output", type=Path, default=Path("solvent_initial.xyz"))
     parser.add_argument("--trajectory", type=Path, default=Path("solvent_nve.xyz"))
-    parser.add_argument("--energy-log", type=Path, default=Path("solvent_energy.log"))
+    parser.add_argument("--energy-log", type=Path, default=Path("fbts_energy.log"))
     parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
     parser.add_argument("--fbts-states", type=int, default=2, help="Default number of FBTS quantum states")
     parser.add_argument("--fbts-init-state", type=int, default=1, help="1-based initially occupied diabatic state for focused initialization")
     parser.add_argument("--fbts-gamma", type=float, default=0.5, help="MMST/FBTS zero-point parameter gamma")
     parser.add_argument("--fbts-hamiltonian-log", type=Path, default=Path("fbts_effective_hamiltonian.log"))
+    parser.add_argument("--fbts-mapping-log", type=Path, default=Path("fbts_mapping_variables.log"))
     return parser.parse_args()
 
 
@@ -1079,7 +1101,9 @@ def main() -> None:
         trajectory_path=args.trajectory,
         energy_log_path=args.energy_log,
         quantum_model=quantum_model,
+        mapping_vars=mapping_vars,
         fbts_hamiltonian_log_path=args.fbts_hamiltonian_log,
+        fbts_mapping_log_path=args.fbts_mapping_log,
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
@@ -1102,6 +1126,7 @@ def main() -> None:
     print(f"Trajectory written to: {args.trajectory}")
     print(f"Energy log written to: {args.energy_log}")
     print(f"FBTS Hamiltonian log written to: {args.fbts_hamiltonian_log}")
+    print(f"FBTS mapping log written to: {args.fbts_mapping_log}")
 
 
 if __name__ == "__main__":
