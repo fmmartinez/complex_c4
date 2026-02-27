@@ -612,9 +612,18 @@ def run_nve_md(
     solvent_bond_distance: float,
     trajectory_path: Path,
     energy_log_path: Path,
+    quantum_model: Optional[FBTSQuantumModel] = None,
+    fbts_hamiltonian_log_path: Optional[Path] = None,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K Q_A Q_H Q_B f_pol r_AH\n", encoding="utf-8")
+
+    if quantum_model is not None and fbts_hamiltonian_log_path is not None:
+        n_states = quantum_model.n_states
+        cols = ["step", "time_fs"]
+        cols.extend([f"h_dia_{i+1}_{j+1}" for i in range(n_states) for j in range(n_states)])
+        cols.extend([f"h_eff_{i+1}_{j+1}" for i in range(n_states) for j in range(n_states)])
+        fbts_hamiltonian_log_path.write_text(" ".join(cols) + "\n", encoding="utf-8")
 
     forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
 
@@ -628,6 +637,14 @@ def run_nve_md(
                 f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f} "
                 f"{q_a:.8f} {q_h:.8f} {q_b:.8f} {f_pol:.8f} {r_ah:.8f}\n"
             )
+
+        if quantum_model is not None and fbts_hamiltonian_log_path is not None:
+            h_dia, _, h_eff = compute_fbts_hamiltonian_terms(sites, quantum_model)
+            vals = [f"{step}", f"{step * dt_fs:.6f}"]
+            vals.extend([f"{h_dia[i, j]:.10f}" for i in range(h_dia.shape[0]) for j in range(h_dia.shape[1])])
+            vals.extend([f"{h_eff[i, j]:.10f}" for i in range(h_eff.shape[0]) for j in range(h_eff.shape[1])])
+            with fbts_hamiltonian_log_path.open("a", encoding="utf-8") as fh:
+                fh.write(" ".join(vals) + "\n")
 
         if step % write_frequency == 0:
             append_xyz_frame(
@@ -932,6 +949,14 @@ def _compute_coupling_matrix_elements(model: FBTSQuantumModel, sites: List[Site]
     return 0.5 * (v_coupling + v_coupling.T)
 
 
+def compute_fbts_hamiltonian_terms(sites: List[Site], quantum_model: FBTSQuantumModel) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r_ab = _compute_r_ab_from_sites(sites)
+    h_dia = interpolate_diabatic_hamiltonian(quantum_model, r_ab)
+    v_coupling = _compute_coupling_matrix_elements(quantum_model, sites, r_ab)
+    h_eff = h_dia + v_coupling
+    return h_dia, v_coupling, h_eff
+
+
 def compute_fbts_total_energy(
     sites: List[Site],
     n_solvent_molecules: int,
@@ -942,9 +967,7 @@ def compute_fbts_total_energy(
     v_solvent = compute_classical_heavy_potential(sites, n_solvent_molecules)
     r_ab = _compute_r_ab_from_sites(sites)
 
-    h_dia = interpolate_diabatic_hamiltonian(quantum_model, r_ab)
-    v_coupling = _compute_coupling_matrix_elements(quantum_model, sites, r_ab)
-    h_eff = h_dia + v_coupling
+    h_dia, v_coupling, h_eff = compute_fbts_hamiltonian_terms(sites, quantum_model)
 
     trace_term = float(np.trace(h_eff))
 
@@ -985,6 +1008,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-log", type=Path, default=Path("solvent_energy.log"))
     parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
     parser.add_argument("--fbts-states", type=int, default=2, help="Default number of FBTS quantum states")
+    parser.add_argument("--fbts-hamiltonian-log", type=Path, default=Path("fbts_effective_hamiltonian.log"))
     return parser.parse_args()
 
 
@@ -1028,6 +1052,8 @@ def main() -> None:
         solvent_bond_distance=args.bond_distance,
         trajectory_path=args.trajectory,
         energy_log_path=args.energy_log,
+        quantum_model=quantum_model,
+        fbts_hamiltonian_log_path=args.fbts_hamiltonian_log,
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
@@ -1048,6 +1074,7 @@ def main() -> None:
     print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
     print(f"Energy log written to: {args.energy_log}")
+    print(f"FBTS Hamiltonian log written to: {args.fbts_hamiltonian_log}")
 
 
 if __name__ == "__main__":
