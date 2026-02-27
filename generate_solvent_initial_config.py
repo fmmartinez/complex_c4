@@ -1156,8 +1156,8 @@ def compute_fbts_total_energy(
     pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
     pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
 
-    h_fwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pfqf))
-    h_bwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pbqb))
+    h_fwd = k_solvent + v_solvent + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pfqf))
+    h_bwd = k_solvent + v_solvent + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pbqb))
     h_tot = 0.5 * (h_fwd + h_bwd)
 
     return {
@@ -1409,7 +1409,7 @@ def compute_fbts_forces_analytical(
 
     pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
     pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
-    coeff = (1.0 / (4.0 * HBAR_KCAL_MOL_FS)) * (pfqf + pbqb) - np.eye(quantum_model.n_states)
+    coeff = (1.0 / (4.0 * HBAR_KCAL_MOL_FS)) * (pfqf + pbqb)
 
     for c in range(3):
         dH_dia_A = dh_dR * (-u_ab[c])
