@@ -450,11 +450,6 @@ def add_ahb_complex(
     for _attempt in range(50000):
         a_pos = random_point_in_sphere(seed_rng, radius_angstrom)
         axis = random_unit_vector(seed_rng)
-        h_pos = (
-            a_pos[0] + 1.0 * axis[0],
-            a_pos[1] + 1.0 * axis[1],
-            a_pos[2] + 1.0 * axis[2],
-        )
         b_pos = (
             a_pos[0] + 2.7 * axis[0],
             a_pos[1] + 2.7 * axis[1],
@@ -463,14 +458,12 @@ def add_ahb_complex(
 
         if (
             norm([a_pos[0], a_pos[1], a_pos[2]]) > radius_angstrom
-            or norm([h_pos[0], h_pos[1], h_pos[2]]) > radius_angstrom
             or norm([b_pos[0], b_pos[1], b_pos[2]]) > radius_angstrom
         ):
             continue
 
         if all(
             dist(a_pos, existing.position_angstrom) >= min_inter_site_distance_angstrom
-            and dist(h_pos, existing.position_angstrom) >= min_inter_site_distance_angstrom
             and dist(b_pos, existing.position_angstrom) >= min_inter_site_distance_angstrom
             for existing in sites
         ):
@@ -487,16 +480,6 @@ def add_ahb_complex(
             sites.append(
                 Site(
                     molecule_id=complex_mol_id,
-                    site_type="H",
-                    label=LABEL["H"],
-                    mass_amu=MASS["H"],
-                    position_angstrom=[h_pos[0], h_pos[1], h_pos[2]],
-                    velocity_ang_fs=sample_velocity(seed_rng, temperature_k, MASS["H"]),
-                )
-            )
-            sites.append(
-                Site(
-                    molecule_id=complex_mol_id,
                     site_type="B",
                     label=LABEL["B"],
                     mass_amu=MASS["B"],
@@ -506,7 +489,7 @@ def add_ahb_complex(
             )
             return
 
-    raise RuntimeError("Could not place A-H-B complex inside placement radius without overlaps.")
+    raise RuntimeError("Could not place A-B complex inside placement radius without overlaps.")
 
 
 def generate_configuration(
@@ -587,8 +570,9 @@ def generate_configuration(
 
 
 def append_xyz_frame(path: Path, sites: List[Site], comment: str) -> None:
-    lines = [str(len(sites)), comment]
-    for site in sites:
+    visible_sites = [s for s in sites if s.site_type != "H"]
+    lines = [str(len(visible_sites)), comment]
+    for site in visible_sites:
         x, y, z = site.position_angstrom
         lines.append(f"{site.label:2s} {x: .8f} {y: .8f} {z: .8f}")
     with path.open("a", encoding="utf-8") as f:
@@ -596,8 +580,9 @@ def append_xyz_frame(path: Path, sites: List[Site], comment: str) -> None:
 
 
 def write_initial_xyz(path: Path, sites: List[Site], comment: str) -> None:
-    lines = [str(len(sites)), comment]
-    for site in sites:
+    visible_sites = [s for s in sites if s.site_type != "H"]
+    lines = [str(len(visible_sites)), comment]
+    for site in visible_sites:
         x, y, z = site.position_angstrom
         lines.append(f"{site.label:2s} {x: .8f} {y: .8f} {z: .8f}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -607,11 +592,16 @@ def write_initial_xyz(path: Path, sites: List[Site], comment: str) -> None:
 def propagate_fbts_mapping_half_step(mapping_vars: FBTSMappingVariables, h_eff: np.ndarray, dt_fs: float) -> None:
     half_scale = 0.5 * dt_fs / HBAR_KCAL_MOL_FS
 
-    mapping_vars.p_fwd -= half_scale * (h_eff @ mapping_vars.q_fwd)
-    mapping_vars.q_fwd += half_scale * (h_eff @ mapping_vars.p_fwd)
+    p_fwd_old = mapping_vars.p_fwd.copy()
+    q_fwd_old = mapping_vars.q_fwd.copy()
+    p_bwd_old = mapping_vars.p_bwd.copy()
+    q_bwd_old = mapping_vars.q_bwd.copy()
 
-    mapping_vars.p_bwd -= half_scale * (h_eff @ mapping_vars.q_bwd)
-    mapping_vars.q_bwd += half_scale * (h_eff @ mapping_vars.p_bwd)
+    mapping_vars.p_fwd = p_fwd_old - half_scale * (h_eff @ q_fwd_old)
+    mapping_vars.q_fwd = q_fwd_old + half_scale * (h_eff @ p_fwd_old)
+
+    mapping_vars.p_bwd = p_bwd_old - half_scale * (h_eff @ q_bwd_old)
+    mapping_vars.q_bwd = q_bwd_old + half_scale * (h_eff @ p_bwd_old)
 
 
 def compute_fbts_forces_selected(
@@ -657,6 +647,13 @@ def compute_fbts_forces_selected(
 
     return forces
 
+
+def _fbts_r_ab_within_bounds(quantum_model: FBTSQuantumModel, sites: List[Site]) -> Tuple[bool, float, float, float]:
+    r_ab = _compute_r_ab_from_sites(sites)
+    r_min = float(np.min(quantum_model.r_values))
+    r_max = float(np.max(quantum_model.r_values))
+    return (r_min <= r_ab <= r_max), r_ab, r_min, r_max
+
 def run_nve_md(
     sites: List[Site],
     n_solvent_molecules: int,
@@ -676,7 +673,7 @@ def run_nve_md(
     fbts_force_compare_fd: bool = False,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
-    energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K Q_A Q_H Q_B f_pol r_AH\n", encoding="utf-8")
+    energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K\n", encoding="utf-8")
 
     if quantum_model is not None and fbts_hamiltonian_log_path is not None:
         n_states = quantum_model.n_states
@@ -700,7 +697,25 @@ def run_nve_md(
             encoding="utf-8",
         )
 
-    forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
+    forces, _, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
+    potential = compute_classical_heavy_potential(sites, n_solvent_molecules)
+
+    fbts_active = quantum_model is not None and mapping_vars is not None
+    if fbts_active:
+        in_bounds, r_ab_init, r_min, r_max = _fbts_r_ab_within_bounds(quantum_model, sites)
+        if not in_bounds:
+            raise ValueError(
+                f"Initial R_AB={r_ab_init:.6f} Å is outside diabatic interpolation bounds [{r_min:.6f}, {r_max:.6f}] Å."
+            )
+        forces = compute_fbts_forces_selected(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            quantum_model=quantum_model,
+            mapping_vars=mapping_vars,
+            force_method=fbts_force_method,
+            fd_step=fbts_force_fd_step,
+            compare_fd=False,
+        )
 
     fbts_active = quantum_model is not None and mapping_vars is not None
     if fbts_active:
@@ -722,8 +737,7 @@ def run_nve_md(
         if step % write_frequency == 0:
             with energy_log_path.open("a", encoding="utf-8") as flog:
                 flog.write(
-                    f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f} "
-                    f"{q_a:.8f} {q_h:.8f} {q_b:.8f} {f_pol:.8f} {r_ah:.8f}\n"
+                    f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f}\n"
                 )
 
             if quantum_model is not None and fbts_hamiltonian_log_path is not None:
@@ -769,7 +783,7 @@ def run_nve_md(
                 (
                     f"step={step} time_fs={step * dt_fs:.3f} "
                     f"KE={kinetic:.6f} PE={potential:.6f} TE={total:.6f} T={temperature:.3f} "
-                    f"Q_A={q_a:.4f} Q_H={q_h:.4f} Q_B={q_b:.4f}"
+                    f"Q_A={q_a:.4f} Q_B={q_b:.4f}"
                 ),
             )
 
@@ -796,7 +810,17 @@ def run_nve_md(
 
         enforce_solvent_bond_constraints(sites, n_solvent_molecules, solvent_bond_distance)
 
-        _, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
+        if fbts_active:
+            in_bounds, r_ab_now, r_min, r_max = _fbts_r_ab_within_bounds(quantum_model, sites)
+            if not in_bounds:
+                print(
+                    f"Stopping trajectory at step={step + 1} time_fs={(step + 1) * dt_fs:.6f}: "
+                    f"R_AB={r_ab_now:.6f} Å outside interpolation bounds [{r_min:.6f}, {r_max:.6f}] Å."
+                )
+                break
+
+        _, _, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
+        potential = compute_classical_heavy_potential(sites, n_solvent_molecules)
 
         if fbts_active:
             new_forces = compute_fbts_forces_selected(
@@ -1486,7 +1510,8 @@ def main() -> None:
     )
 
     initial_ke = kinetic_energy_kcal_mol(sites)
-    _, initial_pe, q_a_i, q_h_i, q_b_i, f_i, r_i = compute_forces_and_potential(sites, args.n_molecules)
+    _, _, q_a_i, q_h_i, q_b_i, f_i, r_i = compute_forces_and_potential(sites, args.n_molecules)
+    initial_pe = compute_classical_heavy_potential(sites, args.n_molecules)
     initial_temp = instantaneous_temperature(sites)
 
     quantum_model = load_fbts_quantum_model(args.diabatic_json, default_n_states=args.fbts_states)
@@ -1505,7 +1530,7 @@ def main() -> None:
             "initial frame chloromethane+AHB "
             f"molecules={args.n_molecules} T_target={args.temperature:.2f}K "
             f"T_inst={initial_temp:.2f}K seed={args.seed} TE={initial_ke + initial_pe:.3f}kcal/mol "
-            f"Q_A={q_a_i:.4f} Q_H={q_h_i:.4f} Q_B={q_b_i:.4f}"
+            f"Q_A={q_a_i:.4f} Q_B={q_b_i:.4f}"
         ),
     )
 
@@ -1529,19 +1554,20 @@ def main() -> None:
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
-    _, final_pe, q_a_f, q_h_f, q_b_f, f_f, r_f = compute_forces_and_potential(sites, args.n_molecules)
+    _, _, q_a_f, q_h_f, q_b_f, f_f, r_f = compute_forces_and_potential(sites, args.n_molecules)
+    final_pe = compute_classical_heavy_potential(sites, args.n_molecules)
     final_temp = instantaneous_temperature(sites)
 
     print(f"Initial KE: {initial_ke:.6f} kcal/mol")
     print(f"Initial PE: {initial_pe:.6f} kcal/mol")
     print(f"Initial TE: {initial_ke + initial_pe:.6f} kcal/mol")
     print(f"Initial temperature: {initial_temp:.3f} K")
-    print(f"Initial charges: Q_A={q_a_i:.6f}, Q_H={q_h_i:.6f}, Q_B={q_b_i:.6f}, f={f_i:.6f}, r_AH={r_i:.6f} Å")
+    print(f"Initial charges: Q_A={q_a_i:.6f}, Q_B={q_b_i:.6f}")
     print(f"Final KE: {final_ke:.6f} kcal/mol")
     print(f"Final PE: {final_pe:.6f} kcal/mol")
     print(f"Final TE: {final_ke + final_pe:.6f} kcal/mol")
     print(f"Final temperature: {final_temp:.3f} K")
-    print(f"Final charges: Q_A={q_a_f:.6f}, Q_H={q_h_f:.6f}, Q_B={q_b_f:.6f}, f={f_f:.6f}, r_AH={r_f:.6f} Å")
+    print(f"Final charges: Q_A={q_a_f:.6f}, Q_B={q_b_f:.6f}")
     print(f"FBTS initialization: focused diabatic state={args.fbts_init_state}, gamma={args.fbts_gamma:.6f}, independent fwd/bwd sampling")
     print(f"FBTS energy (initial geometry): H_fwd={fbts_energy['H_fwd']:.6e}, H_bwd={fbts_energy['H_bwd']:.6e}, H={fbts_energy['H_total']:.6e}")
     print(f"Initial frame written to: {args.initial_output}")
