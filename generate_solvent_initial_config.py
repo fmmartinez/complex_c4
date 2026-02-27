@@ -603,6 +603,60 @@ def write_initial_xyz(path: Path, sites: List[Site], comment: str) -> None:
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+
+def propagate_fbts_mapping_half_step(mapping_vars: FBTSMappingVariables, h_eff: np.ndarray, dt_fs: float) -> None:
+    half_scale = 0.5 * dt_fs / HBAR_KCAL_MOL_FS
+
+    mapping_vars.p_fwd -= half_scale * (h_eff @ mapping_vars.q_fwd)
+    mapping_vars.q_fwd += half_scale * (h_eff @ mapping_vars.p_fwd)
+
+    mapping_vars.p_bwd -= half_scale * (h_eff @ mapping_vars.q_bwd)
+    mapping_vars.q_bwd += half_scale * (h_eff @ mapping_vars.p_bwd)
+
+
+def compute_fbts_forces_selected(
+    sites: List[Site],
+    n_solvent_molecules: int,
+    quantum_model: FBTSQuantumModel,
+    mapping_vars: FBTSMappingVariables,
+    force_method: str,
+    fd_step: float,
+    compare_fd: bool = False,
+    step_label: Optional[int] = None,
+) -> List[List[float]]:
+    if force_method == "analytic":
+        forces = compute_fbts_forces_analytical(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            quantum_model=quantum_model,
+            mapping_vars=mapping_vars,
+        )
+    else:
+        forces = compute_fbts_forces_finite_difference(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            quantum_model=quantum_model,
+            mapping_vars=mapping_vars,
+            delta_angstrom=fd_step,
+        )
+
+    if compare_fd and force_method == "analytic":
+        fd_forces = compute_fbts_forces_finite_difference(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            quantum_model=quantum_model,
+            mapping_vars=mapping_vars,
+            delta_angstrom=fd_step,
+        )
+        max_abs_diff = 0.0
+        for fa, ffv in zip(forces, fd_forces):
+            for ca, cf in zip(fa, ffv):
+                max_abs_diff = max(max_abs_diff, abs(ca - cf))
+        label = "?" if step_label is None else str(step_label)
+        print(f"FBTS force check step={label}: max|F_analytic-F_fd|={max_abs_diff:.6e} kcal/mol/Ang")
+
+    return forces
+
 def run_nve_md(
     sites: List[Site],
     n_solvent_molecules: int,
@@ -648,6 +702,18 @@ def run_nve_md(
 
     forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
 
+    fbts_active = quantum_model is not None and mapping_vars is not None
+    if fbts_active:
+        forces = compute_fbts_forces_selected(
+            sites=sites,
+            n_solvent_molecules=n_solvent_molecules,
+            quantum_model=quantum_model,
+            mapping_vars=mapping_vars,
+            force_method=fbts_force_method,
+            fd_step=fbts_force_fd_step,
+            compare_fd=False,
+        )
+
     for step in range(steps + 1):
         kinetic = kinetic_energy_kcal_mol(sites)
         temperature = instantaneous_temperature(sites)
@@ -679,35 +745,16 @@ def run_nve_md(
                     fm.write(" ".join(vals) + "\n")
 
             if mapping_vars is not None and quantum_model is not None and fbts_force_log_path is not None:
-                if fbts_force_method == "analytic":
-                    fbts_forces = compute_fbts_forces_analytical(
-                        sites=sites,
-                        n_solvent_molecules=n_solvent_molecules,
-                        quantum_model=quantum_model,
-                        mapping_vars=mapping_vars,
-                    )
-                else:
-                    fbts_forces = compute_fbts_forces_finite_difference(
-                        sites=sites,
-                        n_solvent_molecules=n_solvent_molecules,
-                        quantum_model=quantum_model,
-                        mapping_vars=mapping_vars,
-                        delta_angstrom=fbts_force_fd_step,
-                    )
-
-                if fbts_force_compare_fd and fbts_force_method == "analytic":
-                    fd_forces = compute_fbts_forces_finite_difference(
-                        sites=sites,
-                        n_solvent_molecules=n_solvent_molecules,
-                        quantum_model=quantum_model,
-                        mapping_vars=mapping_vars,
-                        delta_angstrom=fbts_force_fd_step,
-                    )
-                    max_abs_diff = 0.0
-                    for fa, ffv in zip(fbts_forces, fd_forces):
-                        for ca, cf in zip(fa, ffv):
-                            max_abs_diff = max(max_abs_diff, abs(ca - cf))
-                    print(f"FBTS force check step={step}: max|F_analytic-F_fd|={max_abs_diff:.6e} kcal/mol/Ang")
+                fbts_forces = compute_fbts_forces_selected(
+                    sites=sites,
+                    n_solvent_molecules=n_solvent_molecules,
+                    quantum_model=quantum_model,
+                    mapping_vars=mapping_vars,
+                    force_method=fbts_force_method,
+                    fd_step=fbts_force_fd_step,
+                    compare_fd=fbts_force_compare_fd,
+                    step_label=step,
+                )
 
                 with fbts_force_log_path.open("a", encoding="utf-8") as ff:
                     for i_site, (site, fvec) in enumerate(zip(sites, fbts_forces)):
@@ -738,6 +785,10 @@ def run_nve_md(
             site.velocity_ang_fs[1] += 0.5 * dt_fs * ay
             site.velocity_ang_fs[2] += 0.5 * dt_fs * az
 
+        if fbts_active:
+            _, _, h_eff_old = compute_fbts_hamiltonian_terms(sites, quantum_model)
+            propagate_fbts_mapping_half_step(mapping_vars, h_eff_old, dt_fs)
+
         for site in sites:
             site.position_angstrom[0] += dt_fs * site.velocity_ang_fs[0]
             site.position_angstrom[1] += dt_fs * site.velocity_ang_fs[1]
@@ -745,7 +796,22 @@ def run_nve_md(
 
         enforce_solvent_bond_constraints(sites, n_solvent_molecules, solvent_bond_distance)
 
-        new_forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
+        _, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
+
+        if fbts_active:
+            new_forces = compute_fbts_forces_selected(
+                sites=sites,
+                n_solvent_molecules=n_solvent_molecules,
+                quantum_model=quantum_model,
+                mapping_vars=mapping_vars,
+                force_method=fbts_force_method,
+                fd_step=fbts_force_fd_step,
+                compare_fd=False,
+            )
+            _, _, h_eff_new = compute_fbts_hamiltonian_terms(sites, quantum_model)
+            propagate_fbts_mapping_half_step(mapping_vars, h_eff_new, dt_fs)
+        else:
+            new_forces, _, _, _, _, _, _ = compute_forces_and_potential(sites, n_solvent_molecules)
 
         for idx, site in enumerate(sites):
             inv_mass = 1.0 / site.mass_amu
