@@ -693,13 +693,32 @@ def run_nve_md(
 
 
 
-def initialize_fbts_mapping_variables(n_states: int, initial_value: float = 0.01) -> FBTSMappingVariables:
+def initialize_fbts_mapping_variables(
+    n_states: int,
+    occupied_state_1based: int = 1,
+    gamma: float = 0.5,
+    rng_seed: Optional[int] = None,
+) -> FBTSMappingVariables:
     if n_states < 1:
         raise ValueError("n_states must be >= 1")
-    p_fwd = np.full(n_states, initial_value, dtype=float)
-    q_fwd = np.full(n_states, initial_value, dtype=float)
-    p_bwd = np.full(n_states, initial_value, dtype=float)
-    q_bwd = np.full(n_states, initial_value, dtype=float)
+    if occupied_state_1based < 1 or occupied_state_1based > n_states:
+        raise ValueError(f"occupied_state_1based must be in [1, {n_states}].")
+    if gamma < 0.0:
+        raise ValueError("gamma must be >= 0.")
+
+    occ = occupied_state_1based - 1
+    radii = np.full(n_states, math.sqrt(2.0 * gamma), dtype=float)
+    radii[occ] = math.sqrt(2.0 * (1.0 + gamma))
+
+    rng = np.random.default_rng(rng_seed)
+    phi_fwd = rng.uniform(0.0, 2.0 * math.pi, size=n_states)
+    phi_bwd = rng.uniform(0.0, 2.0 * math.pi, size=n_states)
+
+    q_fwd = radii * np.cos(phi_fwd)
+    p_fwd = radii * np.sin(phi_fwd)
+    q_bwd = radii * np.cos(phi_bwd)
+    p_bwd = radii * np.sin(phi_bwd)
+
     return FBTSMappingVariables(p_fwd=p_fwd, q_fwd=q_fwd, p_bwd=p_bwd, q_bwd=q_bwd)
 
 
@@ -1008,6 +1027,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-log", type=Path, default=Path("solvent_energy.log"))
     parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
     parser.add_argument("--fbts-states", type=int, default=2, help="Default number of FBTS quantum states")
+    parser.add_argument("--fbts-init-state", type=int, default=1, help="1-based initially occupied diabatic state for focused initialization")
+    parser.add_argument("--fbts-gamma", type=float, default=0.5, help="MMST/FBTS zero-point parameter gamma")
     parser.add_argument("--fbts-hamiltonian-log", type=Path, default=Path("fbts_effective_hamiltonian.log"))
     return parser.parse_args()
 
@@ -1029,7 +1050,12 @@ def main() -> None:
     initial_temp = instantaneous_temperature(sites)
 
     quantum_model = load_fbts_quantum_model(args.diabatic_json, default_n_states=args.fbts_states)
-    mapping_vars = initialize_fbts_mapping_variables(quantum_model.n_states, initial_value=0.01)
+    mapping_vars = initialize_fbts_mapping_variables(
+        quantum_model.n_states,
+        occupied_state_1based=args.fbts_init_state,
+        gamma=args.fbts_gamma,
+        rng_seed=args.seed,
+    )
     fbts_energy = compute_fbts_total_energy(sites, args.n_molecules, quantum_model, mapping_vars)
 
     write_initial_xyz(
@@ -1070,6 +1096,7 @@ def main() -> None:
     print(f"Final TE: {final_ke + final_pe:.6f} kcal/mol")
     print(f"Final temperature: {final_temp:.3f} K")
     print(f"Final charges: Q_A={q_a_f:.6f}, Q_H={q_h_f:.6f}, Q_B={q_b_f:.6f}, f={f_f:.6f}, r_AH={r_f:.6f} Å")
+    print(f"FBTS initialization: focused diabatic state={args.fbts_init_state}, gamma={args.fbts_gamma:.6f}, independent fwd/bwd sampling")
     print(f"FBTS energy (initial geometry): H_fwd={fbts_energy['H_fwd']:.6e}, H_bwd={fbts_energy['H_bwd']:.6e}, H={fbts_energy['H_total']:.6e}")
     print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
