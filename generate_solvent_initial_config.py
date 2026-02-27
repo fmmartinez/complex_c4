@@ -616,6 +616,10 @@ def run_nve_md(
     mapping_vars: Optional[FBTSMappingVariables] = None,
     fbts_hamiltonian_log_path: Optional[Path] = None,
     fbts_mapping_log_path: Optional[Path] = None,
+    fbts_force_log_path: Optional[Path] = None,
+    fbts_force_fd_step: float = 1e-4,
+    fbts_force_method: str = "analytic",
+    fbts_force_compare_fd: bool = False,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K Q_A Q_H Q_B f_pol r_AH\n", encoding="utf-8")
@@ -635,6 +639,12 @@ def run_nve_md(
         cols.extend([f"p_bwd_{i+1}" for i in range(n_states)])
         cols.extend([f"q_bwd_{i+1}" for i in range(n_states)])
         fbts_mapping_log_path.write_text(" ".join(cols) + "\n", encoding="utf-8")
+
+    if mapping_vars is not None and quantum_model is not None and fbts_force_log_path is not None:
+        fbts_force_log_path.write_text(
+            "step time_fs site_index site_type fx_kcal_mol_ang fy_kcal_mol_ang fz_kcal_mol_ang\n",
+            encoding="utf-8",
+        )
 
     forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
 
@@ -667,6 +677,44 @@ def run_nve_md(
                 vals.extend([f"{v:.10f}" for v in mapping_vars.q_bwd])
                 with fbts_mapping_log_path.open("a", encoding="utf-8") as fm:
                     fm.write(" ".join(vals) + "\n")
+
+            if mapping_vars is not None and quantum_model is not None and fbts_force_log_path is not None:
+                if fbts_force_method == "analytic":
+                    fbts_forces = compute_fbts_forces_analytical(
+                        sites=sites,
+                        n_solvent_molecules=n_solvent_molecules,
+                        quantum_model=quantum_model,
+                        mapping_vars=mapping_vars,
+                    )
+                else:
+                    fbts_forces = compute_fbts_forces_finite_difference(
+                        sites=sites,
+                        n_solvent_molecules=n_solvent_molecules,
+                        quantum_model=quantum_model,
+                        mapping_vars=mapping_vars,
+                        delta_angstrom=fbts_force_fd_step,
+                    )
+
+                if fbts_force_compare_fd and fbts_force_method == "analytic":
+                    fd_forces = compute_fbts_forces_finite_difference(
+                        sites=sites,
+                        n_solvent_molecules=n_solvent_molecules,
+                        quantum_model=quantum_model,
+                        mapping_vars=mapping_vars,
+                        delta_angstrom=fbts_force_fd_step,
+                    )
+                    max_abs_diff = 0.0
+                    for fa, ffv in zip(fbts_forces, fd_forces):
+                        for ca, cf in zip(fa, ffv):
+                            max_abs_diff = max(max_abs_diff, abs(ca - cf))
+                    print(f"FBTS force check step={step}: max|F_analytic-F_fd|={max_abs_diff:.6e} kcal/mol/Ang")
+
+                with fbts_force_log_path.open("a", encoding="utf-8") as ff:
+                    for i_site, (site, fvec) in enumerate(zip(sites, fbts_forces)):
+                        ff.write(
+                            f"{step} {step * dt_fs:.6f} {i_site} {site.site_type} "
+                            f"{fvec[0]:.10f} {fvec[1]:.10f} {fvec[2]:.10f}\n"
+                        )
 
             append_xyz_frame(
                 trajectory_path,
@@ -1028,6 +1076,306 @@ def compute_fbts_total_energy(
         "H_total": h_tot,
     }
 
+
+
+def _interpolate_diabatic_hamiltonian_derivative(model: FBTSQuantumModel, r_ab: float) -> np.ndarray:
+    n_states = model.h_dia_mats.shape[1]
+
+    if CubicSpline is not None:
+        cs = CubicSpline(model.r_values, model.h_dia_mats, axis=0, bc_type="natural", extrapolate=True)
+        dh = np.asarray(cs(r_ab, 1), dtype=float)
+    else:
+        dr = 1e-5
+        h_plus = interpolate_diabatic_hamiltonian(model, r_ab + dr)
+        h_minus = interpolate_diabatic_hamiltonian(model, r_ab - dr)
+        dh = (h_plus - h_minus) / (2.0 * dr)
+
+    return 0.5 * (dh + dh.T)
+
+
+def compute_classical_heavy_forces(sites: List[Site], n_solvent_molecules: int) -> List[List[float]]:
+    forces = [[0.0, 0.0, 0.0] for _ in sites]
+    heavy_indices = [i for i, s in enumerate(sites) if s.site_type != "H"]
+
+    for a in range(len(heavy_indices)):
+        i = heavy_indices[a]
+        si = sites[i]
+        xi, yi, zi = si.position_angstrom
+        for b in range(a + 1, len(heavy_indices)):
+            j = heavy_indices[b]
+            sj = sites[j]
+
+            if si.molecule_id == sj.molecule_id and si.molecule_id < n_solvent_molecules:
+                continue
+
+            dx = xi - sj.position_angstrom[0]
+            dy = yi - sj.position_angstrom[1]
+            dz = zi - sj.position_angstrom[2]
+            r2 = dx * dx + dy * dy + dz * dz
+            if r2 < 1e-24:
+                raise ValueError("Encountered overlapping heavy sites; cannot evaluate interactions at zero distance.")
+            r = math.sqrt(r2)
+            inv_r = 1.0 / r
+
+            dUdr = 0.0
+
+            lj_params = get_lj_params(si.site_type, sj.site_type)
+            if lj_params is not None:
+                sigma_ij, epsilon_ij = lj_params
+                sr = sigma_ij * inv_r
+                sr2 = sr * sr
+                sr6 = sr2 * sr2 * sr2
+                sr12 = sr6 * sr6
+                dUdr += 4.0 * epsilon_ij * (-12.0 * sr12 * inv_r + 6.0 * sr6 * inv_r)
+
+            if si.site_type in {"C1", "C2"} and sj.site_type in {"C1", "C2"}:
+                qi = CHARGE[si.site_type]
+                qj = CHARGE[sj.site_type]
+                dUdr += -COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r * inv_r
+
+            if dUdr != 0.0:
+                scale = -dUdr * inv_r
+                fx = scale * dx
+                fy = scale * dy
+                fz = scale * dz
+                forces[i][0] += fx
+                forces[i][1] += fy
+                forces[i][2] += fz
+                forces[j][0] -= fx
+                forces[j][1] -= fy
+                forces[j][2] -= fz
+
+    return forces
+
+
+def _compute_v_coupling_matrix_and_gradients(
+    model: FBTSQuantumModel,
+    sites: List[Site],
+    r_ab: float,
+) -> Tuple[np.ndarray, List[List[np.ndarray]]]:
+    ir = int(np.argmin(np.abs(model.r_values - r_ab)))
+    psi = model.wavefunctions[ir]
+    n_states = model.n_states
+
+    grads = [[np.zeros((n_states, n_states), dtype=float) for _ in range(3)] for _ in sites]
+    v_coupling = np.zeros((n_states, n_states), dtype=float)
+
+    idx_a = idx_b = None
+    solvent_indices: List[int] = []
+    for idx, s in enumerate(sites):
+        if s.site_type == "A":
+            idx_a = idx
+        elif s.site_type == "B":
+            idx_b = idx
+        elif s.site_type in {"C1", "C2"}:
+            solvent_indices.append(idx)
+
+    if idx_a is None or idx_b is None:
+        raise ValueError("A and B sites are required for coupling matrix evaluation.")
+
+    ra = np.asarray(sites[idx_a].position_angstrom, dtype=float)
+    rb = np.asarray(sites[idx_b].position_angstrom, dtype=float)
+    d = rb - ra
+    R = float(np.linalg.norm(d))
+    if R < 1e-12:
+        raise ValueError("R_AB is too small to define proton transfer axis.")
+    u = d / R
+
+    eye3 = np.eye(3)
+
+    q_a_cov = POLARIZATION["Q_A_cov"]
+    q_a_ion = POLARIZATION["Q_A_ion"]
+    q_b_cov = POLARIZATION["Q_B_cov"]
+    q_b_ion = POLARIZATION["Q_B_ion"]
+    q_h = CHARGE["H"]
+
+    f_grid = np.zeros_like(model.r_grid)
+    for k, rah in enumerate(model.r_grid):
+        f_grid[k], _ = polarization_switch(float(rah))
+    dq_a_grid = (q_a_cov + (q_a_ion - q_a_cov) * f_grid) - CHARGE["A"]
+    dq_b_grid = (q_b_cov + (q_b_ion - q_b_cov) * f_grid) - CHARGE["B"]
+
+    for sidx in solvent_indices:
+        s = sites[sidx]
+        rs = np.asarray(s.position_angstrom, dtype=float)
+        q_s = CHARGE[s.site_type]
+
+        # Precompute projection derivatives for each Cartesian axis
+        du_dra = np.zeros((3, 3), dtype=float)
+        du_drb = np.zeros((3, 3), dtype=float)
+        for c in range(3):
+            e = eye3[c]
+            proj = (e - u[c] * u) / R
+            du_dra[c] = -proj
+            du_drb[c] = proj
+
+        rh_grid = ra[None, :] + model.r_grid[:, None] * u[None, :]
+        v_hs_grid = np.zeros_like(model.r_grid)
+
+        dv_hs_dra = np.zeros((3, model.r_grid.shape[0]), dtype=float)
+        dv_hs_drb = np.zeros((3, model.r_grid.shape[0]), dtype=float)
+        dv_hs_drs = np.zeros((3, model.r_grid.shape[0]), dtype=float)
+
+        coeff_h = COULOMB_KCAL_MOL_ANG_E2 * q_h * q_s
+        for g, rah in enumerate(model.r_grid):
+            vec = rh_grid[g] - rs
+            r = max(float(np.linalg.norm(vec)), 1e-12)
+            inv_r = 1.0 / r
+            inv_r3 = inv_r ** 3
+            v_hs_grid[g] = coeff_h * inv_r
+
+            for c in range(3):
+                drh_dra = eye3[c] + rah * du_dra[c]
+                drh_drb = rah * du_drb[c]
+                dvec_dra = drh_dra
+                dvec_drb = drh_drb
+                dvec_drs = -eye3[c]
+
+                dv_hs_dra[c, g] = coeff_h * (-(vec @ dvec_dra) * inv_r3)
+                dv_hs_drb[c, g] = coeff_h * (-(vec @ dvec_drb) * inv_r3)
+                dv_hs_drs[c, g] = coeff_h * (-(vec @ dvec_drs) * inv_r3)
+
+        r_as_vec = ra - rs
+        r_bs_vec = rb - rs
+        r_as = max(float(np.linalg.norm(r_as_vec)), 1e-12)
+        r_bs = max(float(np.linalg.norm(r_bs_vec)), 1e-12)
+        inv_r_as = 1.0 / r_as
+        inv_r_bs = 1.0 / r_bs
+        inv_r_as3 = inv_r_as ** 3
+        inv_r_bs3 = inv_r_bs ** 3
+
+        v_as_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_a_grid * q_s * inv_r_as
+        v_bs_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_b_grid * q_s * inv_r_bs
+        v_total_grid = v_hs_grid + v_as_grid + v_bs_grid
+
+        weighted = model.weights * v_total_grid
+        v_coupling += (psi * weighted[None, :]) @ psi.T
+
+        for c in range(3):
+            d_inv_r_as_dra = -(r_as_vec[c]) * inv_r_as3
+            d_inv_r_as_drs = +(r_as_vec[c]) * inv_r_as3
+            d_inv_r_bs_drb = -(r_bs_vec[c]) * inv_r_bs3
+            d_inv_r_bs_drs = +(r_bs_vec[c]) * inv_r_bs3
+
+            dv_as_dra_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_a_grid * q_s * d_inv_r_as_dra
+            dv_as_drs_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_a_grid * q_s * d_inv_r_as_drs
+            dv_bs_drb_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_b_grid * q_s * d_inv_r_bs_drb
+            dv_bs_drs_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_b_grid * q_s * d_inv_r_bs_drs
+
+            dv_total_dra = dv_hs_dra[c] + dv_as_dra_grid
+            dv_total_drb = dv_hs_drb[c] + dv_bs_drb_grid
+            dv_total_drs = dv_hs_drs[c] + dv_as_drs_grid + dv_bs_drs_grid
+
+            w_ra = model.weights * dv_total_dra
+            w_rb = model.weights * dv_total_drb
+            w_rs = model.weights * dv_total_drs
+
+            grads[idx_a][c] += (psi * w_ra[None, :]) @ psi.T
+            grads[idx_b][c] += (psi * w_rb[None, :]) @ psi.T
+            grads[sidx][c] += (psi * w_rs[None, :]) @ psi.T
+
+    v_coupling = 0.5 * (v_coupling + v_coupling.T)
+    for i in range(len(sites)):
+        for c in range(3):
+            grads[i][c] = 0.5 * (grads[i][c] + grads[i][c].T)
+
+    return v_coupling, grads
+
+
+def compute_fbts_forces_analytical(
+    sites: List[Site],
+    n_solvent_molecules: int,
+    quantum_model: FBTSQuantumModel,
+    mapping_vars: FBTSMappingVariables,
+) -> List[List[float]]:
+    forces = compute_classical_heavy_forces(sites, n_solvent_molecules)
+
+    r_ab = _compute_r_ab_from_sites(sites)
+    h_dia = interpolate_diabatic_hamiltonian(quantum_model, r_ab)
+    dh_dR = _interpolate_diabatic_hamiltonian_derivative(quantum_model, r_ab)
+
+    _, dv_grad = _compute_v_coupling_matrix_and_gradients(quantum_model, sites, r_ab)
+
+    idx_a = idx_b = None
+    for i, s in enumerate(sites):
+        if s.site_type == "A":
+            idx_a = i
+        elif s.site_type == "B":
+            idx_b = i
+    if idx_a is None or idx_b is None:
+        raise ValueError("A and B sites are required to compute FBTS forces.")
+
+    ra = np.asarray(sites[idx_a].position_angstrom, dtype=float)
+    rb = np.asarray(sites[idx_b].position_angstrom, dtype=float)
+    rab_vec = rb - ra
+    rab = float(np.linalg.norm(rab_vec))
+    if rab < 1e-12:
+        raise ValueError("R_AB is too small to compute FBTS forces.")
+    u_ab = rab_vec / rab
+
+    pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
+    pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
+    coeff = (1.0 / (4.0 * HBAR_KCAL_MOL_FS)) * (pfqf + pbqb) - np.eye(quantum_model.n_states)
+
+    for c in range(3):
+        dH_dia_A = dh_dR * (-u_ab[c])
+        dH_dia_B = dh_dR * (u_ab[c])
+
+        dH_A = dH_dia_A + dv_grad[idx_a][c]
+        dH_B = dH_dia_B + dv_grad[idx_b][c]
+
+        forces[idx_a][c] += -float(np.sum(coeff * dH_A))
+        forces[idx_b][c] += -float(np.sum(coeff * dH_B))
+
+    for i, site in enumerate(sites):
+        if site.site_type in {"A", "B", "H"}:
+            continue
+        for c in range(3):
+            dH = dv_grad[i][c]
+            forces[i][c] += -float(np.sum(coeff * dH))
+
+    return forces
+
+def compute_fbts_forces_finite_difference(
+    sites: List[Site],
+    n_solvent_molecules: int,
+    quantum_model: FBTSQuantumModel,
+    mapping_vars: FBTSMappingVariables,
+    delta_angstrom: float = 1e-4,
+) -> List[List[float]]:
+    if delta_angstrom <= 0.0:
+        raise ValueError("delta_angstrom must be positive for finite-difference forces.")
+
+    forces = [[0.0, 0.0, 0.0] for _ in sites]
+
+    for i, site in enumerate(sites):
+        if site.site_type == "H":
+            continue
+
+        for k in range(3):
+            orig = site.position_angstrom[k]
+
+            site.position_angstrom[k] = orig + delta_angstrom
+            e_plus = compute_fbts_total_energy(
+                sites=sites,
+                n_solvent_molecules=n_solvent_molecules,
+                quantum_model=quantum_model,
+                mapping_vars=mapping_vars,
+            )["H_total"]
+
+            site.position_angstrom[k] = orig - delta_angstrom
+            e_minus = compute_fbts_total_energy(
+                sites=sites,
+                n_solvent_molecules=n_solvent_molecules,
+                quantum_model=quantum_model,
+                mapping_vars=mapping_vars,
+            )["H_total"]
+
+            site.position_angstrom[k] = orig
+            forces[i][k] = -(e_plus - e_minus) / (2.0 * delta_angstrom)
+
+    return forces
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate and run NVE MD for coarse-grained chloromethane + AHB complex."
@@ -1052,6 +1400,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fbts-gamma", type=float, default=0.5, help="MMST/FBTS zero-point parameter gamma")
     parser.add_argument("--fbts-hamiltonian-log", type=Path, default=Path("fbts_effective_hamiltonian.log"))
     parser.add_argument("--fbts-mapping-log", type=Path, default=Path("fbts_mapping_variables.log"))
+    parser.add_argument("--fbts-force-log", type=Path, default=Path("fbts_forces.log"))
+    parser.add_argument("--fbts-force-fd-step", type=float, default=1e-4, help="Finite-difference displacement in Angstrom for FBTS force debugging")
+    parser.add_argument("--fbts-force-method", type=str, default="analytic", choices=["analytic", "fd"])
+    parser.add_argument("--fbts-force-compare-fd", action="store_true", help="Also compute FD forces and report max deviation when using analytic forces")
     return parser.parse_args()
 
 
@@ -1104,6 +1456,10 @@ def main() -> None:
         mapping_vars=mapping_vars,
         fbts_hamiltonian_log_path=args.fbts_hamiltonian_log,
         fbts_mapping_log_path=args.fbts_mapping_log,
+        fbts_force_log_path=args.fbts_force_log,
+        fbts_force_fd_step=args.fbts_force_fd_step,
+        fbts_force_method=args.fbts_force_method,
+        fbts_force_compare_fd=args.fbts_force_compare_fd,
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
@@ -1127,6 +1483,8 @@ def main() -> None:
     print(f"Energy log written to: {args.energy_log}")
     print(f"FBTS Hamiltonian log written to: {args.fbts_hamiltonian_log}")
     print(f"FBTS mapping log written to: {args.fbts_mapping_log}")
+    print(f"FBTS force method: {args.fbts_force_method}")
+    print(f"FBTS force log written to: {args.fbts_force_log}")
 
 
 if __name__ == "__main__":
