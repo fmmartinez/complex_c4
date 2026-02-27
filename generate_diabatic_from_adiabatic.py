@@ -217,6 +217,11 @@ def main() -> None:
         "n_eigen": n_sel,
         "requested_R": r_values,
         "processed_R": r_values,
+        "grid": {
+            "values": r_grid.tolist(),
+            "step": dr,
+            "points": int(r_grid.shape[0]),
+        },
         "results": results,
     }
 

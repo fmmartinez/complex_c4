@@ -5,14 +5,23 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import json
 import math
 from pathlib import Path
 import random
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
+try:
+    from scipy.interpolate import CubicSpline
+except ImportError:
+    CubicSpline = None
+
 AMU_TO_KG = 1.66053906660e-27
 KB = 1.380649e-23
 COULOMB_KCAL_MOL_ANG_E2 = 332.063713299
+HBAR_KCAL_MOL_FS = (1.054571817e-34 * 6.02214076e23 / 4184.0) * 1.0e15
 
 # Conversion factors for internal units (angstrom, fs, amu, kcal/mol)
 M_S_TO_ANG_FS = 1e-5
@@ -72,6 +81,24 @@ class Site:
     mass_amu: float
     position_angstrom: List[float]
     velocity_ang_fs: List[float]
+
+
+@dataclass
+class FBTSMappingVariables:
+    p_fwd: np.ndarray
+    q_fwd: np.ndarray
+    p_bwd: np.ndarray
+    q_bwd: np.ndarray
+
+
+@dataclass
+class FBTSQuantumModel:
+    r_values: np.ndarray
+    h_dia_mats: np.ndarray
+    wavefunctions: np.ndarray
+    r_grid: np.ndarray
+    weights: np.ndarray
+    n_states: int
 
 
 def dot(a: List[float], b: List[float]) -> float:
@@ -277,6 +304,8 @@ def compute_forces_and_potential(
             dy = yi - sj.position_angstrom[1]
             dz = zi - sj.position_angstrom[2]
             r2 = dx * dx + dy * dy + dz * dz
+            if r2 < 1e-24:
+                raise ValueError("Encountered overlapping sites; cannot evaluate pairwise interactions at zero distance.")
             r = math.sqrt(r2)
             inv_r = 1.0 / r
 
@@ -583,9 +612,29 @@ def run_nve_md(
     solvent_bond_distance: float,
     trajectory_path: Path,
     energy_log_path: Path,
+    quantum_model: Optional[FBTSQuantumModel] = None,
+    mapping_vars: Optional[FBTSMappingVariables] = None,
+    fbts_hamiltonian_log_path: Optional[Path] = None,
+    fbts_mapping_log_path: Optional[Path] = None,
 ) -> None:
     trajectory_path.write_text("", encoding="utf-8")
     energy_log_path.write_text("step time_fs KE_kcal_mol PE_kcal_mol TE_kcal_mol T_K Q_A Q_H Q_B f_pol r_AH\n", encoding="utf-8")
+
+    if quantum_model is not None and fbts_hamiltonian_log_path is not None:
+        n_states = quantum_model.n_states
+        cols = ["step", "time_fs", "R_AB"]
+        cols.extend([f"h_dia_{i+1}_{j+1}" for i in range(n_states) for j in range(n_states)])
+        cols.extend([f"h_eff_{i+1}_{j+1}" for i in range(n_states) for j in range(n_states)])
+        fbts_hamiltonian_log_path.write_text(" ".join(cols) + "\n", encoding="utf-8")
+
+    if mapping_vars is not None and fbts_mapping_log_path is not None:
+        n_states = mapping_vars.p_fwd.shape[0]
+        cols = ["step", "time_fs"]
+        cols.extend([f"p_fwd_{i+1}" for i in range(n_states)])
+        cols.extend([f"q_fwd_{i+1}" for i in range(n_states)])
+        cols.extend([f"p_bwd_{i+1}" for i in range(n_states)])
+        cols.extend([f"q_bwd_{i+1}" for i in range(n_states)])
+        fbts_mapping_log_path.write_text(" ".join(cols) + "\n", encoding="utf-8")
 
     forces, potential, q_a, q_h, q_b, f_pol, r_ah = compute_forces_and_potential(sites, n_solvent_molecules)
 
@@ -594,13 +643,31 @@ def run_nve_md(
         temperature = instantaneous_temperature(sites)
         total = kinetic + potential
 
-        with energy_log_path.open("a", encoding="utf-8") as flog:
-            flog.write(
-                f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f} "
-                f"{q_a:.8f} {q_h:.8f} {q_b:.8f} {f_pol:.8f} {r_ah:.8f}\n"
-            )
-
         if step % write_frequency == 0:
+            with energy_log_path.open("a", encoding="utf-8") as flog:
+                flog.write(
+                    f"{step} {step * dt_fs:.6f} {kinetic:.10f} {potential:.10f} {total:.10f} {temperature:.6f} "
+                    f"{q_a:.8f} {q_h:.8f} {q_b:.8f} {f_pol:.8f} {r_ah:.8f}\n"
+                )
+
+            if quantum_model is not None and fbts_hamiltonian_log_path is not None:
+                r_ab = _compute_r_ab_from_sites(sites)
+                h_dia, _, h_eff = compute_fbts_hamiltonian_terms(sites, quantum_model)
+                vals = [f"{step}", f"{step * dt_fs:.6f}", f"{r_ab:.10f}"]
+                vals.extend([f"{h_dia[i, j]:.10f}" for i in range(h_dia.shape[0]) for j in range(h_dia.shape[1])])
+                vals.extend([f"{h_eff[i, j]:.10f}" for i in range(h_eff.shape[0]) for j in range(h_eff.shape[1])])
+                with fbts_hamiltonian_log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(" ".join(vals) + "\n")
+
+            if mapping_vars is not None and fbts_mapping_log_path is not None:
+                vals = [f"{step}", f"{step * dt_fs:.6f}"]
+                vals.extend([f"{v:.10f}" for v in mapping_vars.p_fwd])
+                vals.extend([f"{v:.10f}" for v in mapping_vars.q_fwd])
+                vals.extend([f"{v:.10f}" for v in mapping_vars.p_bwd])
+                vals.extend([f"{v:.10f}" for v in mapping_vars.q_bwd])
+                with fbts_mapping_log_path.open("a", encoding="utf-8") as fm:
+                    fm.write(" ".join(vals) + "\n")
+
             append_xyz_frame(
                 trajectory_path,
                 sites,
@@ -646,6 +713,321 @@ def run_nve_md(
         forces = new_forces
 
 
+
+def initialize_fbts_mapping_variables(
+    n_states: int,
+    occupied_state_1based: int = 1,
+    gamma: float = 0.5,
+    rng_seed: Optional[int] = None,
+) -> FBTSMappingVariables:
+    if n_states < 1:
+        raise ValueError("n_states must be >= 1")
+    if occupied_state_1based < 1 or occupied_state_1based > n_states:
+        raise ValueError(f"occupied_state_1based must be in [1, {n_states}].")
+    if gamma < 0.0:
+        raise ValueError("gamma must be >= 0.")
+
+    occ = occupied_state_1based - 1
+    radii = np.full(n_states, math.sqrt(2.0 * gamma), dtype=float)
+    radii[occ] = math.sqrt(2.0 * (1.0 + gamma))
+
+    rng = np.random.default_rng(rng_seed)
+    phi_fwd = rng.uniform(0.0, 2.0 * math.pi, size=n_states)
+    phi_bwd = rng.uniform(0.0, 2.0 * math.pi, size=n_states)
+
+    q_fwd = radii * np.cos(phi_fwd)
+    p_fwd = radii * np.sin(phi_fwd)
+    q_bwd = radii * np.cos(phi_bwd)
+    p_bwd = radii * np.sin(phi_bwd)
+
+    return FBTSMappingVariables(p_fwd=p_fwd, q_fwd=q_fwd, p_bwd=p_bwd, q_bwd=q_bwd)
+
+
+def _natural_cubic_spline_second_derivatives(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    n = x.shape[0]
+    if n < 2:
+        raise ValueError("Need at least two points for interpolation")
+    if n == 2:
+        return np.zeros(2, dtype=float)
+
+    y2 = np.zeros(n, dtype=float)
+    u = np.zeros(n - 1, dtype=float)
+
+    for i in range(1, n - 1):
+        sig = (x[i] - x[i - 1]) / (x[i + 1] - x[i - 1])
+        p = sig * y2[i - 1] + 2.0
+        y2[i] = (sig - 1.0) / p
+        d1 = (y[i + 1] - y[i]) / (x[i + 1] - x[i])
+        d0 = (y[i] - y[i - 1]) / (x[i] - x[i - 1])
+        u[i] = (6.0 * (d1 - d0) / (x[i + 1] - x[i - 1]) - sig * u[i - 1]) / p
+
+    for k in range(n - 2, -1, -1):
+        y2[k] = y2[k] * y2[k + 1] + u[k]
+
+    return y2
+
+
+def _spline_evaluate(x: np.ndarray, y: np.ndarray, y2: np.ndarray, xq: float) -> float:
+    n = x.shape[0]
+    if xq <= x[0]:
+        return float(y[0])
+    if xq >= x[-1]:
+        return float(y[-1])
+
+    klo = int(np.searchsorted(x, xq) - 1)
+    khi = klo + 1
+    h = x[khi] - x[klo]
+    a = (x[khi] - xq) / h
+    b = (xq - x[klo]) / h
+    return float(
+        a * y[klo]
+        + b * y[khi]
+        + ((a * a * a - a) * y2[klo] + (b * b * b - b) * y2[khi]) * (h * h) / 6.0
+    )
+
+
+def load_fbts_quantum_model(diabatic_json_path: Path, default_n_states: int = 2) -> FBTSQuantumModel:
+    data = json.loads(diabatic_json_path.read_text(encoding="utf-8"))
+    results = data["results"]
+    if not results:
+        raise ValueError("diabatic_matrices.json has no results entries.")
+
+    n_eigen_json = int(data.get("n_eigen", default_n_states))
+    n_states = min(default_n_states, n_eigen_json) if default_n_states > 0 else n_eigen_json
+
+    r_values = np.asarray([float(r["R"]) for r in results], dtype=float)
+    order = np.argsort(r_values)
+    r_values = r_values[order]
+
+    h_mats = []
+    psi_grids = []
+
+    grid_meta = data.get("grid")
+    if grid_meta is not None and "values" in grid_meta:
+        r_grid = np.asarray(grid_meta["values"], dtype=float)
+    else:
+        r_grid = None
+
+    for idx in order:
+        row = results[idx]
+        h = np.asarray(row["hamiltonian_reduced_diabatic"], dtype=float)
+        psi = np.asarray(row["r_diagonalized_eigenstates_grid"], dtype=float)
+        h_mats.append(h[:n_states, :n_states])
+        psi_grids.append(psi[:n_states, :])
+
+        if r_grid is None:
+            n_grid = psi.shape[1]
+            r_grid = np.linspace(0.3, 0.3 + 0.02 * (n_grid - 1), n_grid, dtype=float)
+
+    h_dia_mats = np.asarray(h_mats, dtype=float)
+    wavefunctions = np.asarray(psi_grids, dtype=float)
+
+    if h_dia_mats.shape[0] < 2:
+        raise ValueError("Need at least two R points in diabatic data for interpolation.")
+
+    dr = r_grid[1] - r_grid[0]
+    weights = np.full(r_grid.shape[0], dr, dtype=float)
+    weights[0] *= 0.5
+    weights[-1] *= 0.5
+
+    return FBTSQuantumModel(
+        r_values=r_values,
+        h_dia_mats=h_dia_mats,
+        wavefunctions=wavefunctions,
+        r_grid=r_grid,
+        weights=weights,
+        n_states=n_states,
+    )
+
+
+def interpolate_diabatic_hamiltonian(model: FBTSQuantumModel, r_ab: float) -> np.ndarray:
+    n_states = model.h_dia_mats.shape[1]
+
+    if CubicSpline is not None:
+        cs = CubicSpline(model.r_values, model.h_dia_mats, axis=0, bc_type="natural", extrapolate=True)
+        h_interp = np.asarray(cs(r_ab), dtype=float)
+    else:
+        y2 = np.zeros_like(model.h_dia_mats)
+        for i in range(n_states):
+            for j in range(n_states):
+                y2[:, i, j] = _natural_cubic_spline_second_derivatives(model.r_values, model.h_dia_mats[:, i, j])
+
+        h_interp = np.zeros((n_states, n_states), dtype=float)
+        for i in range(n_states):
+            for j in range(n_states):
+                h_interp[i, j] = _spline_evaluate(model.r_values, model.h_dia_mats[:, i, j], y2[:, i, j], r_ab)
+
+    return 0.5 * (h_interp + h_interp.T)
+
+
+def compute_heavy_atom_kinetic_energy_kcal_mol(sites: List[Site]) -> float:
+    heavy_sites = [s for s in sites if s.site_type != "H"]
+    return kinetic_energy_kcal_mol(heavy_sites)
+
+
+def compute_classical_heavy_potential(sites: List[Site], n_solvent_molecules: int) -> float:
+    potential = 0.0
+    heavy_indices = [i for i, s in enumerate(sites) if s.site_type != "H"]
+
+    for a in range(len(heavy_indices)):
+        i = heavy_indices[a]
+        si = sites[i]
+        xi, yi, zi = si.position_angstrom
+        for b in range(a + 1, len(heavy_indices)):
+            j = heavy_indices[b]
+            sj = sites[j]
+
+            if si.molecule_id == sj.molecule_id and si.molecule_id < n_solvent_molecules:
+                continue
+
+            dx = xi - sj.position_angstrom[0]
+            dy = yi - sj.position_angstrom[1]
+            dz = zi - sj.position_angstrom[2]
+            r2 = dx * dx + dy * dy + dz * dz
+            if r2 < 1e-24:
+                raise ValueError("Encountered overlapping heavy sites; cannot evaluate interactions at zero distance.")
+            r = math.sqrt(r2)
+            inv_r = 1.0 / r
+
+            lj_params = get_lj_params(si.site_type, sj.site_type)
+            if lj_params is not None:
+                sigma_ij, epsilon_ij = lj_params
+                sr = sigma_ij * inv_r
+                sr2 = sr * sr
+                sr6 = sr2 * sr2 * sr2
+                sr12 = sr6 * sr6
+                potential += 4.0 * epsilon_ij * (sr12 - sr6)
+
+            if si.site_type in {"C1", "C2"} and sj.site_type in {"C1", "C2"}:
+                qi = CHARGE[si.site_type]
+                qj = CHARGE[sj.site_type]
+                potential += COULOMB_KCAL_MOL_ANG_E2 * qi * qj * inv_r
+
+    return potential
+
+
+def _compute_r_ab_from_sites(sites: List[Site]) -> float:
+    idx_a = idx_b = None
+    for idx, s in enumerate(sites):
+        if s.site_type == "A":
+            idx_a = idx
+        elif s.site_type == "B":
+            idx_b = idx
+    if idx_a is None or idx_b is None:
+        raise ValueError("Could not locate both A and B sites for R_AB.")
+
+    ra = sites[idx_a].position_angstrom
+    rb = sites[idx_b].position_angstrom
+    return math.sqrt((rb[0] - ra[0]) ** 2 + (rb[1] - ra[1]) ** 2 + (rb[2] - ra[2]) ** 2)
+
+
+def _compute_coupling_matrix_elements(model: FBTSQuantumModel, sites: List[Site], r_ab: float) -> np.ndarray:
+    # For this first FBTS block we compute geometry-scaled couplings from solvent electrostatics
+    # involving the quantized proton-related terms (H-C1/H-C2 and A/B switch terms) using
+    # diabatic wavefunction overlaps at nearest R sample.
+    ir = int(np.argmin(np.abs(model.r_values - r_ab)))
+    psi = model.wavefunctions[ir]  # (n_states, n_grid)
+
+    idx_a = idx_b = None
+    solvent_sites = []
+    for idx, s in enumerate(sites):
+        if s.site_type == "A":
+            idx_a = idx
+        elif s.site_type == "B":
+            idx_b = idx
+        elif s.site_type in {"C1", "C2"}:
+            solvent_sites.append(idx)
+
+    if idx_a is None or idx_b is None:
+        raise ValueError("A and B sites are required for coupling matrix evaluation.")
+
+    ra = np.asarray(sites[idx_a].position_angstrom, dtype=float)
+    rb = np.asarray(sites[idx_b].position_angstrom, dtype=float)
+    rab_vec = rb - ra
+    rab_norm = np.linalg.norm(rab_vec)
+    if rab_norm < 1e-12:
+        raise ValueError("R_AB is too small to define proton transfer axis.")
+    e_ab = rab_vec / rab_norm
+
+    n_states = model.n_states
+    v_coupling = np.zeros((n_states, n_states), dtype=float)
+
+    q_a_cov = POLARIZATION["Q_A_cov"]
+    q_a_ion = POLARIZATION["Q_A_ion"]
+    q_b_cov = POLARIZATION["Q_B_cov"]
+    q_b_ion = POLARIZATION["Q_B_ion"]
+    q_h = CHARGE["H"]
+
+    for sidx in solvent_sites:
+        s = sites[sidx]
+        rs = np.asarray(s.position_angstrom, dtype=float)
+        q_s = CHARGE[s.site_type]
+
+        # Project proton coordinate along AB axis and build expected H position for each grid point
+        rh_grid = ra[None, :] + model.r_grid[:, None] * e_ab[None, :]
+        r_hs = np.linalg.norm(rh_grid - rs[None, :], axis=1)
+        r_hs = np.maximum(r_hs, 1e-12)
+        v_hs_grid = COULOMB_KCAL_MOL_ANG_E2 * q_h * q_s / r_hs
+
+        r_as = max(float(np.linalg.norm(ra - rs)), 1e-12)
+        r_bs = max(float(np.linalg.norm(rb - rs)), 1e-12)
+
+        f_grid = np.zeros_like(model.r_grid)
+        for k, rah in enumerate(model.r_grid):
+            f_grid[k], _ = polarization_switch(float(rah))
+
+        dq_a_grid = (q_a_cov + (q_a_ion - q_a_cov) * f_grid) - CHARGE["A"]
+        dq_b_grid = (q_b_cov + (q_b_ion - q_b_cov) * f_grid) - CHARGE["B"]
+
+        v_as_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_a_grid * q_s / r_as
+        v_bs_grid = COULOMB_KCAL_MOL_ANG_E2 * dq_b_grid * q_s / r_bs
+        v_total_grid = v_hs_grid + v_as_grid + v_bs_grid
+
+        weighted = model.weights * v_total_grid
+        v_coupling += (psi * weighted[None, :]) @ psi.T
+
+    return 0.5 * (v_coupling + v_coupling.T)
+
+
+def compute_fbts_hamiltonian_terms(sites: List[Site], quantum_model: FBTSQuantumModel) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r_ab = _compute_r_ab_from_sites(sites)
+    h_dia = interpolate_diabatic_hamiltonian(quantum_model, r_ab)
+    v_coupling = _compute_coupling_matrix_elements(quantum_model, sites, r_ab)
+    h_eff = h_dia + v_coupling
+    return h_dia, v_coupling, h_eff
+
+
+def compute_fbts_total_energy(
+    sites: List[Site],
+    n_solvent_molecules: int,
+    quantum_model: FBTSQuantumModel,
+    mapping_vars: FBTSMappingVariables,
+) -> Dict[str, float]:
+    k_solvent = compute_heavy_atom_kinetic_energy_kcal_mol(sites)
+    v_solvent = compute_classical_heavy_potential(sites, n_solvent_molecules)
+    r_ab = _compute_r_ab_from_sites(sites)
+
+    h_dia, v_coupling, h_eff = compute_fbts_hamiltonian_terms(sites, quantum_model)
+
+    trace_term = float(np.trace(h_eff))
+
+    pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
+    pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
+
+    h_fwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pfqf))
+    h_bwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pbqb))
+    h_tot = 0.5 * (h_fwd + h_bwd)
+
+    return {
+        "K_solvent": k_solvent,
+        "V_solvent": v_solvent,
+        "R_AB": r_ab,
+        "trace_h_eff": trace_term,
+        "H_fwd": h_fwd,
+        "H_bwd": h_bwd,
+        "H_total": h_tot,
+    }
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate and run NVE MD for coarse-grained chloromethane + AHB complex."
@@ -663,7 +1045,13 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--initial-output", type=Path, default=Path("solvent_initial.xyz"))
     parser.add_argument("--trajectory", type=Path, default=Path("solvent_nve.xyz"))
-    parser.add_argument("--energy-log", type=Path, default=Path("solvent_energy.log"))
+    parser.add_argument("--energy-log", type=Path, default=Path("fbts_energy.log"))
+    parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
+    parser.add_argument("--fbts-states", type=int, default=2, help="Default number of FBTS quantum states")
+    parser.add_argument("--fbts-init-state", type=int, default=1, help="1-based initially occupied diabatic state for focused initialization")
+    parser.add_argument("--fbts-gamma", type=float, default=0.5, help="MMST/FBTS zero-point parameter gamma")
+    parser.add_argument("--fbts-hamiltonian-log", type=Path, default=Path("fbts_effective_hamiltonian.log"))
+    parser.add_argument("--fbts-mapping-log", type=Path, default=Path("fbts_mapping_variables.log"))
     return parser.parse_args()
 
 
@@ -682,6 +1070,15 @@ def main() -> None:
     initial_ke = kinetic_energy_kcal_mol(sites)
     _, initial_pe, q_a_i, q_h_i, q_b_i, f_i, r_i = compute_forces_and_potential(sites, args.n_molecules)
     initial_temp = instantaneous_temperature(sites)
+
+    quantum_model = load_fbts_quantum_model(args.diabatic_json, default_n_states=args.fbts_states)
+    mapping_vars = initialize_fbts_mapping_variables(
+        quantum_model.n_states,
+        occupied_state_1based=args.fbts_init_state,
+        gamma=args.fbts_gamma,
+        rng_seed=args.seed,
+    )
+    fbts_energy = compute_fbts_total_energy(sites, args.n_molecules, quantum_model, mapping_vars)
 
     write_initial_xyz(
         args.initial_output,
@@ -703,6 +1100,10 @@ def main() -> None:
         solvent_bond_distance=args.bond_distance,
         trajectory_path=args.trajectory,
         energy_log_path=args.energy_log,
+        quantum_model=quantum_model,
+        mapping_vars=mapping_vars,
+        fbts_hamiltonian_log_path=args.fbts_hamiltonian_log,
+        fbts_mapping_log_path=args.fbts_mapping_log,
     )
 
     final_ke = kinetic_energy_kcal_mol(sites)
@@ -719,9 +1120,13 @@ def main() -> None:
     print(f"Final TE: {final_ke + final_pe:.6f} kcal/mol")
     print(f"Final temperature: {final_temp:.3f} K")
     print(f"Final charges: Q_A={q_a_f:.6f}, Q_H={q_h_f:.6f}, Q_B={q_b_f:.6f}, f={f_f:.6f}, r_AH={r_f:.6f} Å")
+    print(f"FBTS initialization: focused diabatic state={args.fbts_init_state}, gamma={args.fbts_gamma:.6f}, independent fwd/bwd sampling")
+    print(f"FBTS energy (initial geometry): H_fwd={fbts_energy['H_fwd']:.6e}, H_bwd={fbts_energy['H_bwd']:.6e}, H={fbts_energy['H_total']:.6e}")
     print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
     print(f"Energy log written to: {args.energy_log}")
+    print(f"FBTS Hamiltonian log written to: {args.fbts_hamiltonian_log}")
+    print(f"FBTS mapping log written to: {args.fbts_mapping_log}")
 
 
 if __name__ == "__main__":
