@@ -21,7 +21,7 @@ except ImportError:
 AMU_TO_KG = 1.66053906660e-27
 KB = 1.380649e-23
 COULOMB_KCAL_MOL_ANG_E2 = 332.063713299
-HBAR_KCAL_MOL_S = 1.054571817e-34 * 6.02214076e23 / 4184.0
+HBAR_KCAL_MOL_FS = (1.054571817e-34 * 6.02214076e23 / 4184.0) * 1.0e15
 
 # Conversion factors for internal units (angstrom, fs, amu, kcal/mol)
 M_S_TO_ANG_FS = 1e-5
@@ -974,8 +974,8 @@ def compute_fbts_total_energy(
     pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
     pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
 
-    h_fwd = k_solvent + v_solvent + 1.0 / (2.0 * HBAR_KCAL_MOL_S) - trace_term + float(np.sum(h_eff * pfqf))
-    h_bwd = k_solvent + v_solvent + 1.0 / (2.0 * HBAR_KCAL_MOL_S) - trace_term + float(np.sum(h_eff * pbqb))
+    h_fwd = k_solvent + v_solvent + 1.0 / (2.0 * HBAR_KCAL_MOL_FS) - trace_term + float(np.sum(h_eff * pfqf))
+    h_bwd = k_solvent + v_solvent + 1.0 / (2.0 * HBAR_KCAL_MOL_FS) - trace_term + float(np.sum(h_eff * pbqb))
     h_tot = 0.5 * (h_fwd + h_bwd)
 
     return {
