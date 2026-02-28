@@ -18,13 +18,6 @@ try:
 except ImportError:
     CubicSpline = None
 
-import numpy as np
-
-try:
-    from scipy.interpolate import CubicSpline
-except ImportError:
-    CubicSpline = None
-
 AMU_TO_KG = 1.66053906660e-27
 KB = 1.380649e-23
 COULOMB_KCAL_MOL_ANG_E2 = 332.063713299
@@ -833,13 +826,13 @@ def run_nve_md(
                     classical = fbts_details["classical_forces"]
                     diabatic = fbts_details["diabatic_forces"]
                     coupling = fbts_details["coupling_forces"]
-                    total = fbts_details["final_forces"]
+                    force_total = fbts_details["final_forces"]
                     with fbts_force_decompose_log_path.open("a", encoding="utf-8") as fdlog:
                         for i_site, site in enumerate(sites):
                             fc = classical[i_site]
                             fdia = diabatic[i_site]
                             fcp = coupling[i_site]
-                            ft = total[i_site]
+                            ft = force_total[i_site]
                             fdlog.write(
                                 f"{step} {step * dt_fs:.6f} {i_site} {site.site_type} "
                                 f"{fc[0]:.10f} {fc[1]:.10f} {fc[2]:.10f} "
