@@ -25,10 +25,18 @@ try:
 except ImportError:
     CubicSpline = None
 
+import numpy as np
+
+try:
+    from scipy.interpolate import CubicSpline
+except ImportError:
+    CubicSpline = None
+
 AMU_TO_KG = 1.66053906660e-27
 KB = 1.380649e-23
 COULOMB_KCAL_MOL_ANG_E2 = 332.063713299
-HBAR_KCAL_MOL_FS = (1.054571817e-34 * 6.02214076e23 / 4184.0) * 1.0e15
+HBAR_KCAL_MOL_PS = 0.01594
+HBAR_KCAL_MOL_FS = HBAR_KCAL_MOL_PS / 1000.0
 
 # Conversion factors for internal units (angstrom, fs, amu, kcal/mol)
 M_S_TO_ANG_FS = 1e-5
@@ -608,7 +616,8 @@ def propagate_fbts_mapping_half_step(
     dt_sub = 0.5 * dt_fs / mapping_substeps
 
     evals, evecs = np.linalg.eigh(h_eff)
-    omega_dt = (evals / HBAR_KCAL_MOL_FS) * dt_sub
+    dt_sub_ps = dt_sub * 1.0e-3
+    omega_dt = (evals / HBAR_KCAL_MOL_PS) * dt_sub_ps
     cos_term = np.cos(omega_dt)
     sin_term = np.sin(omega_dt)
 
@@ -871,7 +880,7 @@ def initialize_fbts_mapping_variables(
         raise ValueError("n_states must be >= 1")
 
     rng = np.random.default_rng(rng_seed)
-    sigma = math.sqrt(2.0 * HBAR_KCAL_MOL_FS)
+    sigma = math.sqrt(2.0 * HBAR_KCAL_MOL_PS)
 
     p_fwd = rng.normal(loc=0.0, scale=sigma, size=n_states)
     q_fwd = rng.normal(loc=0.0, scale=sigma, size=n_states)
@@ -1152,8 +1161,8 @@ def compute_fbts_total_energy(
     pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
     pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
 
-    h_fwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pfqf))
-    h_bwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_FS)) * float(np.sum(h_eff * pbqb))
+    h_fwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_PS)) * float(np.sum(h_eff * pfqf))
+    h_bwd = k_solvent + v_solvent - trace_term + (1.0 / (2.0 * HBAR_KCAL_MOL_PS)) * float(np.sum(h_eff * pbqb))
     h_tot = 0.5 * (h_fwd + h_bwd)
 
     return {
@@ -1405,7 +1414,7 @@ def compute_fbts_forces_analytical(
 
     pfqf = np.outer(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.outer(mapping_vars.q_fwd, mapping_vars.q_fwd)
     pbqb = np.outer(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.outer(mapping_vars.q_bwd, mapping_vars.q_bwd)
-    coeff = (1.0 / (4.0 * HBAR_KCAL_MOL_FS)) * (pfqf + pbqb) - np.eye(quantum_model.n_states)
+    coeff = (1.0 / (4.0 * HBAR_KCAL_MOL_PS)) * (pfqf + pbqb) - np.eye(quantum_model.n_states)
 
     for c in range(3):
         dH_dia_A = dh_dR * (-u_ab[c])
