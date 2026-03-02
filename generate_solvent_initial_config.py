@@ -18,6 +18,13 @@ try:
 except ImportError:
     CubicSpline = None
 
+import numpy as np
+
+try:
+    from scipy.interpolate import CubicSpline
+except ImportError:
+    CubicSpline = None
+
 AMU_TO_KG = 1.66053906660e-27
 KB = 1.380649e-23
 COULOMB_KCAL_MOL_ANG_E2 = 332.063713299
@@ -628,21 +635,14 @@ def compute_fbts_forces_selected(
     fd_step: float,
     compare_fd: bool = False,
     step_label: Optional[int] = None,
-    return_details: bool = False,
-) -> Any:
-    details: Optional[Dict[str, Any]] = None
+) -> List[List[float]]:
     if force_method == "analytic":
-        analytical_result = compute_fbts_forces_analytical(
+        forces = compute_fbts_forces_analytical(
             sites=sites,
             n_solvent_molecules=n_solvent_molecules,
             quantum_model=quantum_model,
             mapping_vars=mapping_vars,
-            return_details=return_details,
         )
-        if return_details:
-            forces, details = analytical_result
-        else:
-            forces = analytical_result
     else:
         forces = compute_fbts_forces_finite_difference(
             sites=sites,
@@ -667,8 +667,6 @@ def compute_fbts_forces_selected(
         label = "?" if step_label is None else str(step_label)
         print(f"FBTS force check step={label}: max|F_analytic-F_fd|={max_abs_diff:.6e} kcal/mol/Ang")
 
-    if return_details:
-        return forces, details
     return forces
 
 
@@ -692,8 +690,6 @@ def run_nve_md(
     fbts_hamiltonian_log_path: Optional[Path] = None,
     fbts_mapping_log_path: Optional[Path] = None,
     fbts_force_log_path: Optional[Path] = None,
-    fbts_force_decompose_log_path: Optional[Path] = None,
-    fbts_diagnostics_log_path: Optional[Path] = None,
     fbts_force_fd_step: float = 1e-4,
     fbts_force_method: str = "analytic",
     fbts_force_compare_fd: bool = False,
@@ -721,23 +717,6 @@ def run_nve_md(
     if mapping_vars is not None and quantum_model is not None and fbts_force_log_path is not None:
         fbts_force_log_path.write_text(
             "step time_fs site_index site_type fx_kcal_mol_ang fy_kcal_mol_ang fz_kcal_mol_ang\n",
-            encoding="utf-8",
-        )
-
-    if mapping_vars is not None and quantum_model is not None and fbts_force_decompose_log_path is not None:
-        fbts_force_decompose_log_path.write_text(
-            "step time_fs site_index site_type "
-            "fx_classical fy_classical fz_classical "
-            "fx_dia fy_dia fz_dia "
-            "fx_coupling fy_coupling fz_coupling "
-            "fx_total fy_total fz_total\n",
-            encoding="utf-8",
-        )
-
-    if mapping_vars is not None and quantum_model is not None and fbts_diagnostics_log_path is not None:
-        fbts_diagnostics_log_path.write_text(
-            "step time_fs p2q2_fwd p2q2_bwd coeff_fro coeff_max_abs "
-            "max_abs_dh_dR max_abs_dv_grad_A max_abs_dv_grad_B max_abs_dv_grad_solvent\n",
             encoding="utf-8",
         )
 
@@ -790,13 +769,8 @@ def run_nve_md(
                 with fbts_mapping_log_path.open("a", encoding="utf-8") as fm:
                     fm.write(" ".join(vals) + "\n")
 
-            if mapping_vars is not None and quantum_model is not None and (
-                fbts_force_log_path is not None
-                or fbts_force_decompose_log_path is not None
-                or fbts_diagnostics_log_path is not None
-            ):
-                need_details = (fbts_force_decompose_log_path is not None) or (fbts_diagnostics_log_path is not None)
-                force_result = compute_fbts_forces_selected(
+            if mapping_vars is not None and quantum_model is not None and fbts_force_log_path is not None:
+                fbts_forces = compute_fbts_forces_selected(
                     sites=sites,
                     n_solvent_molecules=n_solvent_molecules,
                     quantum_model=quantum_model,
@@ -805,51 +779,13 @@ def run_nve_md(
                     fd_step=fbts_force_fd_step,
                     compare_fd=fbts_force_compare_fd,
                     step_label=step,
-                    return_details=need_details,
                 )
 
-                if need_details:
-                    fbts_forces, fbts_details = force_result
-                else:
-                    fbts_forces = force_result
-                    fbts_details = None
-
-                if fbts_force_log_path is not None:
-                    with fbts_force_log_path.open("a", encoding="utf-8") as ff:
-                        for i_site, (site, fvec) in enumerate(zip(sites, fbts_forces)):
-                            ff.write(
-                                f"{step} {step * dt_fs:.6f} {i_site} {site.site_type} "
-                                f"{fvec[0]:.10f} {fvec[1]:.10f} {fvec[2]:.10f}\n"
-                            )
-
-                if fbts_force_decompose_log_path is not None and fbts_details is not None:
-                    classical = fbts_details["classical_forces"]
-                    diabatic = fbts_details["diabatic_forces"]
-                    coupling = fbts_details["coupling_forces"]
-                    force_total = fbts_details["final_forces"]
-                    with fbts_force_decompose_log_path.open("a", encoding="utf-8") as fdlog:
-                        for i_site, site in enumerate(sites):
-                            fc = classical[i_site]
-                            fdia = diabatic[i_site]
-                            fcp = coupling[i_site]
-                            ft = force_total[i_site]
-                            fdlog.write(
-                                f"{step} {step * dt_fs:.6f} {i_site} {site.site_type} "
-                                f"{fc[0]:.10f} {fc[1]:.10f} {fc[2]:.10f} "
-                                f"{fdia[0]:.10f} {fdia[1]:.10f} {fdia[2]:.10f} "
-                                f"{fcp[0]:.10f} {fcp[1]:.10f} {fcp[2]:.10f} "
-                                f"{ft[0]:.10f} {ft[1]:.10f} {ft[2]:.10f}\n"
-                            )
-
-                if fbts_diagnostics_log_path is not None and fbts_details is not None:
-                    diag = fbts_details["diagnostics"]
-                    with fbts_diagnostics_log_path.open("a", encoding="utf-8") as dlog:
-                        dlog.write(
-                            f"{step} {step * dt_fs:.6f} "
-                            f"{diag['p2q2_fwd']:.10f} {diag['p2q2_bwd']:.10f} "
-                            f"{diag['coeff_fro']:.10f} {diag['coeff_max_abs']:.10f} "
-                            f"{diag['max_abs_dh_dR']:.10f} {diag['max_abs_dv_grad_A']:.10f} "
-                            f"{diag['max_abs_dv_grad_B']:.10f} {diag['max_abs_dv_grad_solvent']:.10f}\n"
+                with fbts_force_log_path.open("a", encoding="utf-8") as ff:
+                    for i_site, (site, fvec) in enumerate(zip(sites, fbts_forces)):
+                        ff.write(
+                            f"{step} {step * dt_fs:.6f} {i_site} {site.site_type} "
+                            f"{fvec[0]:.10f} {fvec[1]:.10f} {fvec[2]:.10f}\n"
                         )
 
             append_xyz_frame(
@@ -929,29 +865,18 @@ def run_nve_md(
 
 def initialize_fbts_mapping_variables(
     n_states: int,
-    occupied_state_1based: int = 1,
-    gamma: float = 0.5,
     rng_seed: Optional[int] = None,
 ) -> FBTSMappingVariables:
     if n_states < 1:
         raise ValueError("n_states must be >= 1")
-    if occupied_state_1based < 1 or occupied_state_1based > n_states:
-        raise ValueError(f"occupied_state_1based must be in [1, {n_states}].")
-    if gamma < 0.0:
-        raise ValueError("gamma must be >= 0.")
-
-    occ = occupied_state_1based - 1
-    radii = np.full(n_states, math.sqrt(2.0 * gamma), dtype=float)
-    radii[occ] = math.sqrt(2.0 * (1.0 + gamma))
 
     rng = np.random.default_rng(rng_seed)
-    phi_fwd = rng.uniform(0.0, 2.0 * math.pi, size=n_states)
-    phi_bwd = rng.uniform(0.0, 2.0 * math.pi, size=n_states)
+    sigma = math.sqrt(2.0 * HBAR_KCAL_MOL_FS)
 
-    q_fwd = radii * np.cos(phi_fwd)
-    p_fwd = radii * np.sin(phi_fwd)
-    q_bwd = radii * np.cos(phi_bwd)
-    p_bwd = radii * np.sin(phi_bwd)
+    p_fwd = rng.normal(loc=0.0, scale=sigma, size=n_states)
+    q_fwd = rng.normal(loc=0.0, scale=sigma, size=n_states)
+    p_bwd = rng.normal(loc=0.0, scale=sigma, size=n_states)
+    q_bwd = rng.normal(loc=0.0, scale=sigma, size=n_states)
 
     return FBTSMappingVariables(p_fwd=p_fwd, q_fwd=q_fwd, p_bwd=p_bwd, q_bwd=q_bwd)
 
@@ -1452,13 +1377,8 @@ def compute_fbts_forces_analytical(
     n_solvent_molecules: int,
     quantum_model: FBTSQuantumModel,
     mapping_vars: FBTSMappingVariables,
-    return_details: bool = False,
-) -> Any:
-    classical_forces = compute_classical_heavy_forces(sites, n_solvent_molecules)
-    classical_np = np.asarray(classical_forces, dtype=float)
-    forces = classical_np.copy()
-    diabatic_np = np.zeros_like(classical_np)
-    coupling_np = np.zeros_like(classical_np)
+) -> List[List[float]]:
+    forces = compute_classical_heavy_forces(sites, n_solvent_molecules)
 
     r_ab = _compute_r_ab_from_sites(sites)
     h_dia = interpolate_diabatic_hamiltonian(quantum_model, r_ab)
@@ -1491,18 +1411,11 @@ def compute_fbts_forces_analytical(
         dH_dia_A = dh_dR * (-u_ab[c])
         dH_dia_B = dh_dR * (u_ab[c])
 
-        dH_A = dH_dia_A + dv_grad[idx_a][c]
-        dH_B = dH_dia_B + dv_grad[idx_b][c]
-
         f_dia_a = -float(np.sum(coeff * dH_dia_A))
         f_dia_b = -float(np.sum(coeff * dH_dia_B))
         f_cp_a = -float(np.sum(coeff * dv_grad[idx_a][c]))
         f_cp_b = -float(np.sum(coeff * dv_grad[idx_b][c]))
 
-        diabatic_np[idx_a, c] += f_dia_a
-        diabatic_np[idx_b, c] += f_dia_b
-        coupling_np[idx_a, c] += f_cp_a
-        coupling_np[idx_b, c] += f_cp_b
         forces[idx_a][c] += f_dia_a + f_cp_a
         forces[idx_b][c] += f_dia_b + f_cp_b
 
@@ -1512,38 +1425,8 @@ def compute_fbts_forces_analytical(
         for c in range(3):
             dH = dv_grad[i][c]
             f_cp = -float(np.sum(coeff * dH))
-            coupling_np[i, c] += f_cp
             forces[i][c] += f_cp
-
-    if not return_details:
-        return forces.tolist()
-
-    solvent_indices = [i for i, site in enumerate(sites) if site.site_type in {"C1", "C2"}]
-    max_abs_dv_grad_solvent = 0.0
-    if solvent_indices:
-        max_abs_dv_grad_solvent = max(
-            float(np.max(np.abs(dv_grad[i][c])))
-            for i in solvent_indices
-            for c in range(3)
-        )
-
-    details: Dict[str, Any] = {
-        "classical_forces": classical_np.tolist(),
-        "diabatic_forces": diabatic_np.tolist(),
-        "coupling_forces": coupling_np.tolist(),
-        "final_forces": forces.tolist(),
-        "diagnostics": {
-            "p2q2_fwd": float(np.dot(mapping_vars.p_fwd, mapping_vars.p_fwd) + np.dot(mapping_vars.q_fwd, mapping_vars.q_fwd)),
-            "p2q2_bwd": float(np.dot(mapping_vars.p_bwd, mapping_vars.p_bwd) + np.dot(mapping_vars.q_bwd, mapping_vars.q_bwd)),
-            "coeff_fro": float(np.linalg.norm(coeff)),
-            "coeff_max_abs": float(np.max(np.abs(coeff))),
-            "max_abs_dh_dR": float(np.max(np.abs(dh_dR))),
-            "max_abs_dv_grad_A": float(max(np.max(np.abs(dv_grad[idx_a][c])) for c in range(3))),
-            "max_abs_dv_grad_B": float(max(np.max(np.abs(dv_grad[idx_b][c])) for c in range(3))),
-            "max_abs_dv_grad_solvent": max_abs_dv_grad_solvent,
-        },
-    }
-    return forces.tolist(), details
+    return forces
 
 def compute_fbts_forces_finite_difference(
     sites: List[Site],
@@ -1605,13 +1488,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--energy-log", type=Path, default=Path("fbts_energy.log"))
     parser.add_argument("--diabatic-json", type=Path, default=Path("diabatic_matrices.json"))
     parser.add_argument("--fbts-states", type=int, default=2, help="Default number of FBTS quantum states")
-    parser.add_argument("--fbts-init-state", type=int, default=1, help="1-based initially occupied diabatic state for focused initialization")
-    parser.add_argument("--fbts-gamma", type=float, default=0.5, help="MMST/FBTS zero-point parameter gamma")
     parser.add_argument("--fbts-hamiltonian-log", type=Path, default=Path("fbts_effective_hamiltonian.log"))
     parser.add_argument("--fbts-mapping-log", type=Path, default=Path("fbts_mapping_variables.log"))
     parser.add_argument("--fbts-force-log", type=Path, default=Path("fbts_forces.log"))
-    parser.add_argument("--fbts-force-decompose-log", type=Path, default=None, help="Optional per-site FBTS force decomposition log path")
-    parser.add_argument("--fbts-diagnostics-log", type=Path, default=None, help="Optional FBTS diagnostics log path")
     parser.add_argument("--fbts-force-fd-step", type=float, default=1e-4, help="Finite-difference displacement in Angstrom for FBTS force debugging")
     parser.add_argument("--fbts-force-method", type=str, default="analytic", choices=["analytic", "fd"])
     parser.add_argument("--fbts-force-compare-fd", action="store_true", help="Also compute FD forces and report max deviation when using analytic forces")
@@ -1639,8 +1518,6 @@ def main() -> None:
     quantum_model = load_fbts_quantum_model(args.diabatic_json, default_n_states=args.fbts_states)
     mapping_vars = initialize_fbts_mapping_variables(
         quantum_model.n_states,
-        occupied_state_1based=args.fbts_init_state,
-        gamma=args.fbts_gamma,
         rng_seed=args.seed,
     )
     fbts_energy = compute_fbts_total_energy(sites, args.n_molecules, quantum_model, mapping_vars)
@@ -1670,8 +1547,6 @@ def main() -> None:
         fbts_hamiltonian_log_path=args.fbts_hamiltonian_log,
         fbts_mapping_log_path=args.fbts_mapping_log,
         fbts_force_log_path=args.fbts_force_log,
-        fbts_force_decompose_log_path=args.fbts_force_decompose_log,
-        fbts_diagnostics_log_path=args.fbts_diagnostics_log,
         fbts_force_fd_step=args.fbts_force_fd_step,
         fbts_force_method=args.fbts_force_method,
         fbts_force_compare_fd=args.fbts_force_compare_fd,
@@ -1693,7 +1568,7 @@ def main() -> None:
     print(f"Final TE: {final_ke + final_pe:.6f} kcal/mol")
     print(f"Final temperature: {final_temp:.3f} K")
     print(f"Final charges: Q_A={q_a_f:.6f}, Q_B={q_b_f:.6f}")
-    print(f"FBTS initialization: focused diabatic state={args.fbts_init_state}, gamma={args.fbts_gamma:.6f}, independent fwd/bwd sampling")
+    print("FBTS initialization: independent Gaussian sampling p,q ~ N(0, 2*hbar)")
     print(f"FBTS energy (initial geometry): H_fwd={fbts_energy['H_fwd']:.6e}, H_bwd={fbts_energy['H_bwd']:.6e}, H={fbts_energy['H_total']:.6e}")
     print(f"Initial frame written to: {args.initial_output}")
     print(f"Trajectory written to: {args.trajectory}")
