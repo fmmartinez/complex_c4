@@ -9,7 +9,21 @@ import json
 import math
 from pathlib import Path
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+
+try:
+    from scipy.interpolate import CubicSpline
+except ImportError:
+    CubicSpline = None
+
+import numpy as np
+
+try:
+    from scipy.interpolate import CubicSpline
+except ImportError:
+    CubicSpline = None
 
 import numpy as np
 
